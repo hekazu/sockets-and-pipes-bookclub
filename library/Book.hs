@@ -8,6 +8,10 @@ import System.FilePath ((</>))
 import qualified System.IO as IO
 import Control.Exception.Safe (tryAny)
 import Control.Monad.Trans.Resource (ReleaseKey, ResourceT, allocate, runResourceT)
+--Chapter 2: Chunks
+import qualified Data.Text as T
+import qualified Data.Text.IO as T
+import qualified Data.Char as Char
 
 -- Chapter 1: Handles
 
@@ -118,3 +122,110 @@ fileResourceMaybe = do
     Left e -> do
       print (displayException e)
       return Nothing
+
+
+-- Chapter 2: Chunks
+
+-- Quick rewrite of Hello World examples using Text
+helloText :: IO ()
+helloText = T.hPutStrLn stdout $ T.pack "hello world!"
+
+helloTextFile :: IO ()
+helloTextFile = runResourceT do
+  dir <- liftIO getDataDir
+  (_, h) <- fileResource (dir </> "greeting.txt") WriteMode
+  liftIO do
+    T.hPutStrLn h $ T.pack "hello"
+    T.hPutStrLn h $ T.pack "world"
+
+-- Reading from a handle
+-- We do not read lines because someone might give us infinite data. Let's do
+-- chunks instead!
+printFileContentsUpperCase :: IO ()
+printFileContentsUpperCase = runResourceT do
+  dir <- liftIO getDataDir
+  (_, h) <- fileResource (dir </> "greeting.txt") ReadMode
+  liftIO $ printCapitalizedText h
+
+printCapitalizedText :: Handle -> IO ()
+printCapitalizedText h = proceed
+  where
+    proceed = do
+      -- Get a chunk
+      chunk <- T.hGetChunk h
+      -- If the chunk is empty, we are done, otherwise we process the chunk
+      case (T.null chunk) of
+        True -> return ()
+        -- Changed inline `do` to `(>>)` implementation
+        False -> T.putStr (T.toUpper chunk) >> proceed
+
+-- Writing that every time would be a bit of a chore. Let's make an abstraction:
+repeatUntilIO :: IO chunk -> (chunk -> Bool) -> (chunk -> IO ()) -> IO ()
+repeatUntilIO getChunk isEnd f = proceed
+  where
+    proceed = do
+      chunk <- getChunk
+      case (isEnd chunk) of
+        True -> return ()
+        False -> f chunk >> proceed
+
+-- And now the above, using our abstraction:
+printFileContentsUpperCase2 :: IO ()
+printFileContentsUpperCase2 = runResourceT @IO do
+  dir <- liftIO getDataDir
+  (_, h) <- fileResource (dir </> "greeting.txt") ReadMode
+  liftIO $ repeatUntilIO (T.hGetChunk h) T.null \chunk -> T.putStr $ T.toUpper chunk
+
+-- Exercises!
+--
+-- 4. Find the Numbers
+-- Get only numeric characters from a Text
+digitsOnly :: Text -> Text
+digitsOnly = T.filter Char.isDigit
+
+-- 5. Capitalize the last
+-- Capitalize the last letter of a Text
+capitalizeLast :: Text -> Text
+capitalizeLast text = case T.unsnoc text of
+  Just (front, final) -> T.snoc front $ Char.toUpper final
+  Nothing -> T.empty
+
+-- 6. Paren removal
+-- Remove one layer of parentheses from the text if possible
+unParen :: Text -> Maybe Text
+unParen text = case T.uncons text of
+  Just ('(',rest) -> case T.unsnoc rest of
+    Just (stripped,')') -> Just stripped
+    _ -> Nothing
+  _ -> Nothing
+
+-- 7. Character count
+-- Count the characters in a file, by refactoring an old solution into
+-- something nicer
+characterCount :: FilePath -> IO Int
+characterCount fp = runResourceT do
+  dir <- liftIO getDataDir
+  (_, h) <- fileResource (dir </> fp) ReadMode
+  liftIO $ countChunkChars h
+
+countChunkChars :: Handle -> IO Int
+countChunkChars h = proceed 0
+  where
+    proceed x = do
+      chunk <- T.hGetChunk h
+      case (T.null chunk) of
+        True -> return x
+        False -> proceed $ x + T.length chunk
+
+-- 8. Beyond IO
+-- Since `repeatUntilIO` doesn't actually do IO specifics, let's generalise it
+repeatUntil :: Monad m => m chunk -> (chunk -> Bool) -> (chunk -> m ()) -> m ()
+repeatUntil getChunk isEnd f = proceed
+  where
+    proceed = do
+      chunk <- getChunk
+      unless (isEnd chunk) $ f chunk >> proceed
+
+-- 9. When and unless
+-- We modify the above function to use either `when` or `unless` from
+-- `Control.Monad`
