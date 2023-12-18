@@ -6,10 +6,13 @@ with more value where shown as an example rather than actually used in
 projects proper.
 
 Little of the work here is original, and as was said I am not the book's
-author. I do take responsibility of the Nix configurations though. Those
+author. I do take responsibility of the Nix configurations though[^1]. Those
 did not come with the book.
 
 Done as part of Helsinki Haskell Users Book Club
 
 Get your copy of Sockets an Pipes from Leanpub here:
 <https://leanpub.com/sockets-and-pipes>
+
+[^1]: One should note that they also don't presently work with ghci and one
+  should rather employ `cabal repl` as the book author intended.
