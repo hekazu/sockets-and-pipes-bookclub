@@ -12,6 +12,9 @@ import Control.Monad.Trans.Resource (ReleaseKey, ResourceT, allocate, runResourc
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
 import qualified Data.Char as Char
+-- Chaper 3: Bytes
+import qualified Data.ByteString as BS
+import qualified Data.Text.Encoding as T
 
 -- Chapter 1: Handles
 
@@ -213,9 +216,7 @@ countChunkChars h = proceed 0
   where
     proceed x = do
       chunk <- T.hGetChunk h
-      case (T.null chunk) of
-        True -> return x
-        False -> proceed $ x + T.length chunk
+      if T.null chunk then return x else proceed $ x + T.length chunk
 
 -- 8. Beyond IO
 -- Since `repeatUntilIO` doesn't actually do IO specifics, let's generalise it
@@ -229,3 +230,61 @@ repeatUntil getChunk isEnd f = proceed
 -- 9. When and unless
 -- We modify the above function to use either `when` or `unless` from
 -- `Control.Monad`
+
+
+-- Chapter 3: Bytes
+
+exampleBytes :: [Word8]
+exampleBytes = [104, 101, 108, 108, 111]
+
+-- We have written, we have read, now let us do both!
+copyGreetingFile :: IO ()
+copyGreetingFile = runResourceT do
+  dir <- liftIO getDataDir
+  (_,h1) <- binaryFileResource (dir </> "greeting.txt") ReadMode
+  (_,h2) <- binaryFileResource (dir </> "greeting2.txt") WriteMode
+  -- We avoided defining a lambda here in the action to do with the chunks
+  -- given HLS is rather unhappy about some decisions made in representation.
+  --
+  -- This may not be optimal for the material itself (less digestible as there
+  -- are tricks involved), but it should reinforce the learning to see how things
+  -- actually work under the hood rather than copy-pasting.
+  liftIO $ repeatUntil (BS.hGetSome h1 1_024) BS.null (BS.hPutStr h2)
+
+binaryFileResource :: FilePath -> IOMode -> ResourceT IO (ReleaseKey, Handle)
+binaryFileResource path mode = allocate (IO.openBinaryFile path mode) IO.hClose
+
+-- And now, what you have all been waiting for, a Hello World that produces
+-- specifically UTF-8 encoded and Unix line terminated output!
+helloByteString :: IO ()
+helloByteString = do
+  IO.hSetBinaryMode stdout True
+  BS.hPut stdout $ BS.pack helloBytes
+
+helloBytes :: [Word8]
+helloBytes = [
+  104, 101, 108, 108, 111,      -- hello
+  32,                           -- space
+  119, 111, 114, 108, 100, 33,  -- world!
+  10 ]                          -- \n
+
+helloUtf8 :: IO ()
+helloUtf8 = do
+  IO.hSetBinaryMode stdout True
+  BS.hPutStr stdout . T.encodeUtf8 $ T.pack "hello world!\n"
+
+-- Exercises!
+--
+-- 10. Character encoding bug
+-- How may we misuse the below function to produce "wrong" output?
+greet :: ByteString -> IO ()
+greet nameBs = case T.decodeUtf8' nameBs of
+  Left _ -> putStrLn "Invalid byte string"
+  Right nameText -> T.putStrLn $ T.pack "Hello, " <> nameText
+-- Answer: Feed it UTF-32 encoded data with umlauts, e.g.
+--   greet . T.encodeUtf32LE $ T.pack "Älli Pöllönen"
+
+-- 11. Byte manipulation
+-- Make the following function convert lowercase ASCII characters to uppercase
+asciiUpper :: ByteString -> ByteString
+asciiUpper = BS.map \w -> if w > 96 then w - 32 else w

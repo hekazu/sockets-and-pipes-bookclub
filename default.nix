@@ -9,5 +9,6 @@ in
       pkgs.haskell.lib.addBuildTools drv (with pkgs.haskellPackages;
         [ cabal-install
           ghcid
+          haskell-language-server
         ]);
   }
