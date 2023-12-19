@@ -15,6 +15,11 @@ import qualified Data.Char as Char
 -- Chaper 3: Bytes
 import qualified Data.ByteString as BS
 import qualified Data.Text.Encoding as T
+-- Chapter4: Sockets
+import Network.Socket (Socket)
+import Network.Socket as S
+import Network.Socket.ByteString as S
+
 
 -- Chapter 1: Handles
 
@@ -288,3 +293,100 @@ greet nameBs = case T.decodeUtf8' nameBs of
 -- Make the following function convert lowercase ASCII characters to uppercase
 asciiUpper :: ByteString -> ByteString
 asciiUpper = BS.map \w -> if w > 96 then w - 32 else w
+
+
+-- Chapter 4: Sockets
+
+-- Might work, but we forget to close the socket (whoops)
+makeFriend :: S.SockAddr -> IO ()
+makeFriend address = do
+  s <- S.socket S.AF_INET S.Stream S.defaultProtocol
+  S.connect s address
+  S.sendAll s . T.encodeUtf8 $ T.pack "Hello, will you be my friend?"
+  repeatUntil (S.recv s 1_024) BS.null BS.putStr
+
+-- Okay, now we should be good for safety, right? But what if we wanted to use a
+-- non-stream socket and/or IPv6?
+makeFriendSafely :: S.SockAddr -> IO ()
+makeFriendSafely address = runResourceT do
+  (_, s) <- allocate (S.socket S.AF_INET S.Stream S.defaultProtocol) S.close
+  liftIO do
+    S.setSocketOption s S.UserTimeout 1_000
+    S.connect s address
+    S.sendAll s . T.encodeUtf8 $ T.pack "Hello, will you be my friend?"
+    repeatUntil (S.recv s 1_024) BS.null BS.putStr
+    S.gracefulClose s 1_000
+
+-- Let's just get all the means to connect somewhere, and...
+findHaskellWebsite :: IO S.AddrInfo
+findHaskellWebsite = do
+  addrInfos <- S.getAddrInfo
+    (Just S.defaultHints { S.addrSocketType = S.Stream })
+    (Just "www.haskell.org")
+    (Just "http")
+  case addrInfos of
+    [] -> fail "getAddrInfo returned []"
+    x : _ -> return x
+
+-- Presto! A more general version!
+makeFriendAddrInfo :: S.AddrInfo -> IO ()
+makeFriendAddrInfo addressInfo = runResourceT do
+  (_, s) <- allocate (S.openSocket addressInfo) S.close
+  liftIO do
+    S.setSocketOption s S.UserTimeout 1_000
+    S.connect s $ S.addrAddress addressInfo
+    S.sendAll s . T.encodeUtf8 $ T.pack "Hello, will you be my friend?"
+    repeatUntil (S.recv s 1_024) BS.null BS.putStr
+    S.gracefulClose s 1_000
+
+-- Exercises!
+--
+-- 12. Improper ResourceT allocation
+-- Since we need to open a socket and connect to make any use of a socket,
+-- why don't we combine that?
+openAndConnect :: S.AddrInfo -> ResourceT IO (ReleaseKey, Socket)
+openAndConnect addressInfo = allocate setup S.close
+  where
+    setup = do
+      s <- S.openSocket addressInfo
+      S.setSocketOption s S.UserTimeout 1_000
+      S.connect s $ S.addrAddress addressInfo
+      return s
+-- LGTM! Or does it? What's wrong here?
+--   Answer: If connect fails during setup, we are not yet ready to clean up via
+--     ResourceT. We should instead perform the connection *after* allocation.
+
+-- 13. Explore Gopherspace
+-- Let us define a variant of findHaskellWebsite that uses the Gopher protocol
+findGopherSite :: IO S.AddrInfo
+findGopherSite = do
+  addrInfos <- S.getAddrInfo
+    Nothing
+    (Just "gopher.metafilter.com")
+    (Just "gopher")
+  case addrInfos of
+    [] -> fail "getAddrInfo returned []"
+    x : _ -> return x
+
+contactGopherSite :: IO ()
+contactGopherSite = runResourceT do
+  addrInfo <- liftIO findGopherSite
+  (_, s) <- allocate (S.openSocket addrInfo) S.close
+  liftIO do
+    S.connect s $ S.addrAddress addrInfo
+    S.sendAll s . T.encodeUtf8 $ T.pack "\r\n"
+    repeatUntil (S.recv s 1_024) BS.null BS.putStr
+    S.gracefulClose s 1_000
+
+-- 14. Address resolution
+-- Well, since resolving addresses is pretty common let's just generalise it
+-- while we are at it, shall we?
+resolve :: S.ServiceName -> S.HostName -> IO S.AddrInfo
+resolve sName hName = do
+  addrInfos <- S.getAddrInfo
+    Nothing
+    (Just hName)
+    (Just sName)
+  case addrInfos of
+    [] -> fail "getAddrInfo returned []"
+    x : _ -> return x
