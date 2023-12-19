@@ -16,7 +16,7 @@ import qualified Data.Char as Char
 import qualified Data.ByteString as BS
 import qualified Data.Text.Encoding as T
 -- Chapter4: Sockets
-import Network.Socket (Socket)
+import Network.Socket()
 import Network.Socket as S
 import Network.Socket.ByteString as S
 
