@@ -15,10 +15,15 @@ import qualified Data.Char as Char
 -- Chaper 3: Bytes
 import qualified Data.ByteString as BS
 import qualified Data.Text.Encoding as T
--- Chapter4: Sockets
+-- Chapter 4: Sockets
 import Network.Socket()
 import Network.Socket as S
 import Network.Socket.ByteString as S
+-- Chapter 5: HTTP
+import qualified ASCII as A
+import qualified ASCII.Char as A
+import Network.Simple.TCP (serve, HostPreference (..))
+import qualified Network.Simple.TCP as Net
 
 
 -- Chapter 1: Handles
@@ -344,8 +349,8 @@ makeFriendAddrInfo addressInfo = runResourceT do
 -- 12. Improper ResourceT allocation
 -- Since we need to open a socket and connect to make any use of a socket,
 -- why don't we combine that?
-openAndConnect :: S.AddrInfo -> ResourceT IO (ReleaseKey, Socket)
-openAndConnect addressInfo = allocate setup S.close
+openAndConnect' :: S.AddrInfo -> ResourceT IO (ReleaseKey, Socket)
+openAndConnect' addressInfo = allocate setup S.close
   where
     setup = do
       s <- S.openSocket addressInfo
@@ -355,6 +360,14 @@ openAndConnect addressInfo = allocate setup S.close
 -- LGTM! Or does it? What's wrong here?
 --   Answer: If connect fails during setup, we are not yet ready to clean up via
 --     ResourceT. We should instead perform the connection *after* allocation.
+-- Which we now demonstrate here for Chapter 5 exercises.
+openAndConnect :: S.AddrInfo -> ResourceT IO (ReleaseKey, Socket)
+openAndConnect addressInfo = do
+  (rk, s) <- allocate (S.openSocket addressInfo) S.close
+  liftIO do
+    S.setSocketOption s S.UserTimeout 1_000
+    S.connect s $ S.addrAddress addressInfo
+  return (rk, s)
 
 -- 13. Explore Gopherspace
 -- Let us define a variant of findHaskellWebsite that uses the Gopher protocol
@@ -390,3 +403,116 @@ resolve sName hName = do
   case addrInfos of
     [] -> fail "getAddrInfo returned []"
     x : _ -> return x
+
+
+-- Chapter 5: HTTP
+--
+-- Where we begin reading copious amounts of RFCs
+
+-- First things first, we do take an example supplied by RFC 9110 and turn
+-- it into an ASCII representation. Note that we use the Windows format of
+-- line break when it comes to HTTP, for so it is specified.
+helloRequestString :: ByteString
+helloRequestString = fromString $
+  "GET /hello.txt HTTP/1.1\r\nUser-Agent: curl/7.64.1\r\n" <>
+  "Host: www.example.com\r\nAccept-Language: en, mi\r\n\r\n"
+
+-- Given the above way is tedious, let us help ourselves out some
+rawLine :: ByteString -> ByteString
+rawLine = (<> fromString "\r\n")
+
+-- Better.
+helloRequestLineString :: ByteString
+helloRequestLineString =
+  rawLine (fromString "GET /hello.txt HTTP/1.1") <>
+  rawLine (fromString "User-Agent: curl/7.64.1") <>
+  -- host rawLine was initially missing from the example
+  rawLine (fromString "Host: www.example.com") <>
+  rawLine (fromString "Accept-Language: en, mi") <>
+  rawLine (fromString "")
+
+-- We still have the footgun of Unicode though. We ought not to use it here
+-- where the spec specifically demands ASCII, and Haskell String literals are
+-- Unicode by default. Well, we do also have ASCII support. Observe:
+helloRequestASCIIString :: ByteString
+helloRequestASCIIString =
+  line [A.string|GET /hello.txt HTTP/1.1|] <>
+  line [A.string|User-Agent: curl/7.64.1|] <>
+  line [A.string|Host: www.example.com|] <>
+  line [A.string|Accept-Language: en, mi|] <>
+  line [A.string||]
+
+crlf :: [A.Char]
+crlf = [A.CarriageReturn, A.LineFeed]
+
+line :: ByteString -> ByteString
+line = (<> A.fromCharList crlf)
+
+-- I didn't want to replace any previous definitions. I sure hope hanging on
+-- to these and inventing more names for the namespace won't end up biting me.
+-- I have, at least, ensured the outputs of all the above helloRequestXXXString
+-- functions are equal to one another
+
+-- I don't think this will have much value, but let's include it too since all
+-- the requests were included already
+helloResponseString :: ByteString
+helloResponseString =
+  line [A.string|HTTP/1.1 200 OK|] <>
+  line [A.string|Content-Type: text/plain; charset=us-ascii|] <>
+  line [A.string|Content-Length: 6|] <>
+  line [A.string||] <>
+  -- Make note of not using `line` here. The body is a Wild West bereft of
+  -- rules. Anything goes there, as long as the length (in bytes) checks out.
+  [A.string|Hello!|]
+
+-- This marks the spot where we begin to shift away from the network library and
+-- moving towards network-simple.
+-- Chief functions to consider:
+--   S.sendAll -> Net.send (IO vs MonadIO)
+--   S.recv -> Net.recv (empty marks end VS Maybe as return type)
+--   serve (this exists now)
+
+ourFirstServer :: IO ()
+ourFirstServer = serve @IO HostAny "8000" \(s, a) -> do
+  putStrLn $ "New connection from " <> show a
+  Net.send s helloResponseString
+
+
+-- Exercises!
+--
+-- 15. Repeat until nothing
+-- We've got `repeatUntil` in exercise 8. It is now time to apply Maybe
+-- processing in place of checking for chunk emptiness.
+repeatUntilNothing :: Monad m => m (Maybe chunk) -> (chunk -> m ()) -> m ()
+repeatUntilNothing getChunk f = proceed
+  where
+    proceed = whenJustM getChunk f >> proceed
+
+-- Why yes, we *can* define `repeatUntil` via repeatUntilNothing. Not the other
+-- way around though, I don't think. I assume to be soon proven wrong.
+repeatUntil' :: Monad m => m chunk -> (chunk -> Bool) -> (chunk -> m ()) -> m ()
+repeatUntil' getChunk isEnd = repeatUntilNothing getMaybeChunk
+  where
+    getMaybeChunk = do
+      chunk <- getChunk
+      return $ if isEnd chunk then Nothing else Just chunk
+-- FWIW I was proven wrong, but my solution was the better kind anyway so we
+-- don't end up doing tons of extra work for nothing.
+
+-- 16. Make an HTTP request
+-- We shall query haskell.org and see what we get.
+-- Restrictions: Use `repeatUntilNothing`, `openAndConnect`, `resolve` and
+-- `line`
+queryHaskellDotOrg :: IO ()
+queryHaskellDotOrg = runResourceT do
+  addrInfo <- liftIO $ resolve "http" "haskell.org"
+  (_, s) <- openAndConnect addrInfo
+  Net.send s query
+  liftIO $ repeatUntilNothing (Net.recv s 1_024) BS.putStr
+  where
+    query :: ByteString
+    query =
+      line [A.string|GET / HTTP/1.1|] <>
+      line [A.string|Host: haskell.org|] <>
+      line [A.string|Connection: close|] <>
+      line [A.string||]
