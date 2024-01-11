@@ -28,6 +28,12 @@ import qualified Network.Simple.TCP as Net
 import ASCII (ASCII)
 import ASCII.Decimal (Digit(..))
 import qualified Data.ByteString.Lazy as LBS
+-- Chapter 7: Encoding
+import qualified Data.ByteString.Builder as BSB
+import qualified Data.Text.Lazy.Builder as TB
+import qualified Data.Text.Lazy as LT
+import qualified Data.Text.Lazy.IO as LT
+import qualified Data.Time as Time
 
 
 -- Chapter 1: Handles
@@ -576,3 +582,152 @@ helloResponse = Response status [ctype, len] body
             (FieldName [A.string|Content-Length|])
             (FieldValue [A.string|6|])
     body = Just $ Body [A.string|Hello!|]
+
+-- 19. Infinite byte strings
+-- Find a function for constructing a lazy bytestring out of an infinite
+-- string that does not crash GHCi.
+-- Done, it was `LBS.cycle $ LBS.pack [Word8-literals]`
+-- But the example was more elegant, so...
+infiniteLaughs :: LByteString
+infiniteLaughs = LBS.cycle [A.string|ha|]
+
+laugh :: Int64 -> LByteString
+laugh n = LBS.take n infiniteLaughs
+
+-- Chapter 7: Encoding
+--
+-- Where we turn the above data types to actual ByteString responses
+-- Let's start with a bit of building, shall we? First things first, good old
+-- Monoid instance for Text (not a builder)
+sayHello :: Text -> Text
+sayHello name = T.pack "Hello, " <> name <> T.pack "!"
+
+-- And now, let us use a builder for this. Same thing, different means.
+sayHelloWithBuilder :: Text -> Text
+sayHelloWithBuilder name = LT.toStrict . TB.toLazyText $
+  TB.fromString "Hello " <> TB.fromText name <> TB.fromString "!"
+
+-- That does not look more convenient in the slightest. What's the catch?
+-- Well you see, we can have far more source types this way, so we have at least
+-- that going for us which is nice. Additionally, we may not always want to use
+-- strict text anyway, given that LazyText might just be sufficient for our means.
+-- Consider printing, for instance. We don't need to have all the text in one
+-- place. Chunks around the memory is fine. Observe:
+printHello :: Text -> IO ()
+printHello name = LT.putStrLn . TB.toLazyText $
+  TB.fromString "Hello " <> TB.fromText name <> TB.fromString "!"
+
+-- But that hardly seems worth it. What gives?
+-- Memory. Memory gives. Do a plain monoid and you have the name from the
+-- functions in memory multiple times. Check the chapter for more details.
+-- Full details are not there either, but you'll get the gist of it.
+-- Anyway, let's do some speed measurement casually!
+time :: IO () -> IO ()
+time action = do
+  a <- Time.getCurrentTime
+  action
+  b <- Time.getCurrentTime
+  print $ Time.diffUTCTime b a
+
+concatWithStrict :: Int -> Text
+concatWithStrict n = fold . replicate n $ T.pack "a"
+
+concatWithBuilder :: Int -> Text
+concatWithBuilder n = LT.toStrict . TB.toLazyText .
+  fold . replicate n $ TB.fromString "a"
+
+-- And because Haskell is lazy we need to use these values somewhere
+concatSpeedTest :: Int -> IO ()
+concatSpeedTest n = do
+  dir <- getDataDir
+  time $ T.writeFile (dir </> "strict.txt") (concatWithStrict n)
+  time $ T.writeFile (dir </> "builder.txt") (concatWithBuilder n)
+
+-- Okay, we promised to build the responses, so let's get to it shall we?
+-- We are going to get concatenating lots, so builders will be our friends.
+encodeLineEnd :: BSB.Builder
+encodeLineEnd = A.fromCharList crlf
+
+encodeRequest :: Request -> BSB.Builder
+encodeRequest (Request requestLine fields bodyMaybe) =
+  encodeRequestLine requestLine
+  <> repeatedlyEncode (\x -> encodeField x <> encodeLineEnd) fields
+  <> encodeLineEnd
+  <> optionallyEncode encodeBody bodyMaybe
+
+encodeResponse :: Response -> BSB.Builder
+encodeResponse (Response statusLine fields bodyMaybe) =
+  encodeStatusLine statusLine
+  <> repeatedlyEncode (\x -> encodeField x <> encodeLineEnd) fields
+  <> encodeLineEnd
+  <> optionallyEncode encodeBody bodyMaybe
+
+repeatedlyEncode :: (a -> BSB.Builder) -> [a] -> BSB.Builder
+-- Okay this is quite different from the original suggestion, but I do like it
+-- It is also mentioned in the material a bit later, so the latter inclusion
+-- makes even more sense
+repeatedlyEncode = foldMap
+-- Including book example for reference:
+--   fun enc xs = fold (map enc xs)
+
+optionallyEncode :: (a -> BSB.Builder) -> Maybe a -> BSB.Builder
+optionallyEncode enc (Just x) = enc x
+optionallyEncode _ Nothing = mempty
+-- What I didn't originally notice is that this, too, can be a foldMap
+-- Makes sense, given how Maybe monoid folds.
+
+encodeRequestLine :: RequestLine -> BSB.Builder
+encodeRequestLine (RequestLine method target version) =
+  encodeMethod method <> A.fromCharList [A.Space]
+  <> encodeRequestTarget target <> A.fromCharList [A.Space]
+  <> encodeVersion version <> encodeLineEnd
+
+encodeMethod :: Method -> BSB.Builder
+encodeMethod (Method x) = BSB.byteString $ A.lift x
+
+encodeRequestTarget :: RequestTarget -> BSB.Builder
+encodeRequestTarget (RequestTarget trg) = BSB.byteString $ A.lift trg
+
+encodeStatusLine :: StatusLine -> BSB.Builder
+encodeStatusLine (StatusLine version code reason) =
+  encodeVersion version <> A.fromCharList [A.Space]
+  <> encodeStatusCode code <> A.fromCharList [A.Space]
+  <> optionallyEncode encodeReasonPhrase reason
+  <> encodeLineEnd
+
+encodeStatusCode :: StatusCode -> BSB.Builder
+encodeStatusCode (StatusCode x y z) = A.fromDigitList [x,y,z]
+
+encodeReasonPhrase :: ReasonPhrase -> BSB.Builder
+encodeReasonPhrase (ReasonPhrase phr) = BSB.byteString $ A.lift phr
+
+encodeVersion :: Version -> BSB.Builder
+encodeVersion (Version x y) =
+  [A.string|HTTP/|] <> A.fromDigitList [x] <> [A.string|.|] <> A.fromDigitList [y]
+
+-- Exercises!
+--
+-- 20. Field encoding
+-- You know the drill.
+encodeField :: Field -> BSB.Builder
+encodeField (Field name content) =
+  encodeFieldName name <> [A.string|: |]
+  <> encodeFieldValue content
+
+encodeFieldName :: FieldName -> BSB.Builder
+encodeFieldName (FieldName fname) = BSB.byteString $ A.lift fname
+
+encodeFieldValue :: FieldValue -> BSB.Builder
+encodeFieldValue (FieldValue content) = BSB.byteString $ A.lift content
+
+-- 21. Body encoding
+encodeBody :: Body -> BSB.Builder
+encodeBody (Body bd) = BSB.lazyByteString bd
+
+-- 22. Encoding test
+-- Now did they work? Let's test this out! In `cabal repl`!
+-- We cannot exactly measure this with the earlier string representations
+-- since they are fundamentally different in content, due to things like
+-- user agent fields etc. being involved in the strings.
+-- But we do get reasonable looking values out! And while the request is what
+-- it is, the response works fine!
