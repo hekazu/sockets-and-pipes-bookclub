@@ -24,6 +24,10 @@ import qualified ASCII as A
 import qualified ASCII.Char as A
 import Network.Simple.TCP (serve, HostPreference (..))
 import qualified Network.Simple.TCP as Net
+-- Chapter 6: HTTP Types
+import ASCII (ASCII)
+import ASCII.Decimal (Digit(..))
+import qualified Data.ByteString.Lazy as LBS
 
 
 -- Chapter 1: Handles
@@ -516,3 +520,59 @@ queryHaskellDotOrg = runResourceT do
       line [A.string|Host: haskell.org|] <>
       line [A.string|Connection: close|] <>
       line [A.string||]
+
+
+-- Chapter 6: HTTP Types
+--
+-- Where we take a moment to represent HTTP as Haskell types
+data Request = Request RequestLine [Field] (Maybe Body)
+data Response = Response StatusLine [Field] (Maybe Body)
+
+data RequestLine = RequestLine Method RequestTarget Version
+data Method = Method (ASCII ByteString)
+data RequestTarget = RequestTarget (ASCII ByteString)
+data Version = Version Digit Digit
+
+data StatusLine = StatusLine Version StatusCode (Maybe ReasonPhrase)
+data StatusCode = StatusCode Digit Digit Digit
+data ReasonPhrase = ReasonPhrase (ASCII ByteString)
+
+data Field = Field FieldName FieldValue
+data FieldName = FieldName (ASCII ByteString)
+data FieldValue = FieldValue (ASCII ByteString)
+
+-- Relude at play here with a type alias
+data Body = Body LByteString
+
+-- Exercises!
+-- 18. Construct some values
+-- Where we try to use the above types to represent a pair of example
+-- messages
+helloRequest :: Request
+helloRequest = Request start [host, lang] Nothing
+  where
+    start = RequestLine
+              (Method [A.string|GET|])
+              (RequestTarget [A.string|/hello.txt|])
+              (Version Digit1 Digit1)
+    host = Field
+             (FieldName [A.string|Host|])
+             (FieldValue [A.string|www.example.com|])
+    lang = Field
+             (FieldName [A.string|Accept-Language|])
+             (FieldValue [A.string|en, mi|])
+
+helloResponse :: Response
+helloResponse = Response status [ctype, len] body
+  where
+    status = StatusLine
+               (Version Digit1 Digit1)
+               (StatusCode Digit2 Digit0 Digit0)
+               (Just $ ReasonPhrase [A.string|OK|])
+    ctype = Field
+              (FieldName [A.string|Content-Type|])
+              (FieldValue [A.string|text/plain; charset=us-ascii|])
+    len = Field
+            (FieldName [A.string|Content-Length|])
+            (FieldValue [A.string|6|])
+    body = Just $ Body [A.string|Hello!|]
