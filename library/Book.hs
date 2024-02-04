@@ -731,3 +731,65 @@ encodeBody (Body bd) = BSB.lazyByteString bd
 -- user agent fields etc. being involved in the strings.
 -- But we do get reasonable looking values out! And while the request is what
 -- it is, the response works fine!
+
+
+-- Chapter 8: Responding
+--
+-- Let's begin with a classic hit counter
+countHelloAscii :: Natural -> ASCII LByteString
+countHelloAscii count = [A.string|Hello!|] <> A.fromCharList crlf <> case count of
+    0 -> [A.string|This page has never been viewed.|]
+    1 -> [A.string|This page has been viewed 1 time.|]
+    _ -> [A.string|This page has been viewed |] <>
+          A.showIntegralDecimal count <> [A.string| times.|]
+
+data Status = Status StatusCode (Maybe ReasonPhrase)
+
+ok :: Status
+ok = Status (StatusCode Digit2 Digit0 Digit0) (Just $ ReasonPhrase [A.string|OK|])
+
+-- This causes a shadowing warning
+status :: Status -> StatusLine
+status (Status code phrase) = StatusLine http_1_1 code phrase
+
+http_1_1 :: Version
+http_1_1 = Version Digit1 Digit1
+
+-- And these would prefer to have type signatures
+-- I might fix these in a later commit when the warnings annoy me enough
+contentType = FieldName [A.string|Content-Type|]
+plainAscii = FieldValue [A.string|text/plain; charset=us-ascii|]
+contentLength = FieldName [A.string|Content-Length|]
+
+asciiOk :: ASCII LByteString -> Response
+asciiOk str = Response (status ok) [typ, len] (Just body)
+  where
+    typ = Field contentType plainAscii
+    len = Field contentLength (bodyLengthValue body)
+    body = Body $ A.lift str
+
+bodyLengthValue :: Body -> FieldValue
+bodyLengthValue (Body x) = FieldValue . A.showIntegralDecimal $ LBS.length x
+
+sendResponse :: Socket -> Response -> IO ()
+sendResponse s r = Net.sendLazy s . BSB.toLazyByteString $ encodeResponse r
+
+stuckCountingServer :: IO ()
+stuckCountingServer = serve @IO HostAny "8000" \(s, _) -> do
+  let count = 0 -- to-do!
+  sendResponse s . asciiOk $ countHelloAscii count
+
+-- Exercises!
+-- 23. Read the header
+-- Curl usually only gives us the response body. We want to see our server is
+-- actually doing what we wanted it to, so let's see the header too.
+-- The trick is to dump headers via curl to stdout. We did it!
+
+-- 24. Overflow
+-- We need to break the following:
+mid :: Word8 -> Word8 -> Word8
+mid x y = div (x+y) 2
+-- What about a couple values over the halfway point? Yea, that'll do.
+-- What about fixing it?
+fixdMid :: Word8 -> Word8 -> Word8
+fixdMid x y = fromInteger $ (toInteger x + toInteger y) `div` 2
