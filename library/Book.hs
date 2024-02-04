@@ -34,6 +34,16 @@ import qualified Data.Text.Lazy.Builder as TB
 import qualified Data.Text.Lazy as LT
 import qualified Data.Text.Lazy.IO as LT
 import qualified Data.Time as Time
+-- Chapter 9: Content Types
+import qualified Data.Text.Lazy.Builder.Int as TB
+import qualified Data.Text.Lazy.Encoding as LT
+import Text.Blaze.Html (Html, toHtml)
+import Text.Blaze.Html.Renderer.Utf8 (renderHtml)
+import qualified Text.Blaze.Html5 as HTML
+import qualified Data.Aeson as J
+import qualified Data.Aeson.Key as J.Key
+import qualified Data.Aeson.KeyMap as J.KeyMap
+import Data.Aeson (ToJSON (toJSON), (.=))
 
 
 -- Chapter 1: Handles
@@ -793,3 +803,122 @@ mid x y = div (x+y) 2
 -- What about fixing it?
 fixdMid :: Word8 -> Word8 -> Word8
 fixdMid x y = fromInteger $ (toInteger x + toInteger y) `div` 2
+
+
+-- Chapter 9: Content Types
+-- Oh boy here we go, to the wild wild land of MIME types.
+plainUtf8 :: FieldValue
+plainUtf8 = FieldValue [A.string|text/plain; charset=utf-8|]
+
+htmlUtf8 :: FieldValue
+htmlUtf8 = FieldValue [A.string|text/html; charset=utf-8|]
+
+json :: FieldValue
+json = FieldValue [A.string|application/json|]
+
+countHelloText :: Natural -> LText
+countHelloText count = TB.toLazyText $
+  TB.fromString "Hello! \9835\r\n" <>
+  case count of
+    0 -> TB.fromString "This page has never been viewed."
+    1 -> TB.fromString "This page has been viewed 1 time."
+    _ -> TB.fromString "This page has been viewed " <>
+         TB.decimal count <> TB.fromString " times."
+
+-- The headers are still ascii, but now we get to do the body in another
+-- content type because we tell the responder it is UTF-8 now :)
+textOk :: LText -> Response
+textOk str = Response (status ok) [typ, len] (Just body)
+  where
+    typ = Field contentType plainUtf8
+    len = Field contentLength (bodyLengthValue body)
+    body = Body $ LT.encodeUtf8 str
+
+stuckCountingServerText :: IO ()
+stuckCountingServerText = serve HostAny "8000" \(s, _) -> do
+  let count = 0 -- to-do!
+  sendResponse s . textOk $ countHelloText count
+
+-- Here we could skip past HTML and JSON if we were not interested. I choose
+-- to be, so here we go!
+countHelloHtml :: Natural -> Html
+countHelloHtml count = HTML.docType <> htmlDocument
+  where
+    htmlDocument = HTML.html $ documentMetadata <> documentBody
+
+    documentMetadata = HTML.head titleHtml
+    titleHtml = HTML.title $ toHtml "My great web page"
+
+    documentBody = HTML.body $ greetingHtml <> HTML.hr <> hitCounterHtml
+    greetingHtml = HTML.p $ toHtml "Hello! \9835"
+    hitCounterHtml = HTML.p $ case count of
+      0 -> toHtml "This page has never been viewed."
+      1 -> toHtml "This page has been viewed 1 time."
+      _ -> toHtml "This page has been viewed " <>
+           -- look, a type application! Just so we can be sure we get it right.
+           toHtml @Natural count <> toHtml " times."
+
+-- And now that we have the full HTML thing we *could* now turn it to an UTF-8
+-- bytestring of the lazy sort via `Text.Blaze.Html.Renderer.Utf8.renderHtml`.
+-- Apparently we are not doing so here though, as it is JSON time!
+
+countHelloJson :: Natural -> J.Value
+countHelloJson count = toJSON $ J.KeyMap.fromList [greetingJson, hitsJson]
+  where
+    greetingJson = (J.Key.fromString "greeting", toJSON "Hello! \9835")
+
+    hitsJson = (J.Key.fromString "hits",
+      toJSON $ J.KeyMap.fromList [numberJson, messageJson])
+
+    numberJson = (J.Key.fromString "count", toJSON count)
+    messageJson = (J.Key.fromString "message", toJSON $ countHelloText count)
+-- We could make this less legible and more terse. Observe:
+countHelloJsonTerse :: Natural -> J.Value
+countHelloJsonTerse count = J.object [
+  fromString "greeting" .= fromString @Text "Hello! \9835",
+  fromString "hits" .= J.object [
+    fromString "count" .= count,
+    fromString "message" .= countHelloText count
+    ]
+  ]
+
+jsonOk :: J.Value -> Response
+jsonOk str = Response (status ok) [typ, len] (Just body)
+  where
+    typ = Field contentType json
+    len = Field contentLength $ bodyLengthValue body
+    body = Body $ J.encode str
+
+
+-- Exercises!
+-- 25. HTML in the browser
+-- Complete the following two functions and test them in browser
+htmlOk :: Html -> Response
+htmlOk content = Response (status ok) [typ, len] (Just body)
+  where
+    typ = Field contentType htmlUtf8
+    len = Field contentLength $ bodyLengthValue body
+    body = Body $ renderHtml content
+
+stuckCountingServerHtml :: IO ()
+stuckCountingServerHtml = serve HostAny "8000" \(s, _) -> do
+  let count = 0 -- to-do!
+  sendResponse s . htmlOk $ countHelloHtml count
+
+-- 26. Type Ambiquity
+-- What if we were to remove the `@Text` annotation from the terse JSON
+-- example, I wonder? Let's see what the error message says and what does it
+-- mean to us, if anything!
+--
+-- Well, it clearly say the type is ambiguous. Unable to figure out what
+-- `isString` type it should be, since many JSON content types fit in the
+-- field's content. Maybe it is a J.Value? Or a J.KeyMap? No, no it is not.
+-- But the machine cannot tell.
+
+-- 27. Encoding with class
+-- Well now, we could always use a typeclass based type conversion for
+-- bytestring. Let's soo how it looks like and why we should or should not do
+-- such a thing!
+class Encode a where
+  encode :: a -> BSB.Builder
+-- you know what, not tonight. I'll continue from here at a better time.
