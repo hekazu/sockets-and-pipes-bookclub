@@ -921,4 +921,33 @@ stuckCountingServerHtml = serve HostAny "8000" \(s, _) -> do
 -- such a thing!
 class Encode a where
   encode :: a -> BSB.Builder
--- you know what, not tonight. I'll continue from here at a better time.
+
+instance Encode Request where
+  encode = encodeRequest
+
+instance Encode Response where
+  encode = encodeResponse
+
+instance Encode Integer where
+  encode = BSB.integerDec
+
+instance Encode Int64 where
+  encode = BSB.int64Dec
+
+-- The following two instances rely on the two instances after them. This is
+-- a brilliant idea that certainly does not make anything harder to understand.
+-- It certainly does reduce repeated code though.
+instance Encode Text where
+  encode = encode . T.encodeUtf8
+
+instance Encode LText where
+  encode = encode . LT.encodeUtf8
+
+instance Encode ByteString where
+  encode = BSB.byteString
+
+instance Encode LByteString where
+  encode = BSB.lazyByteString
+
+instance Encode BSB.Builder where
+  encode = id
