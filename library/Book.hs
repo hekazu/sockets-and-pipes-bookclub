@@ -44,6 +44,8 @@ import qualified Data.Aeson as J
 import qualified Data.Aeson.Key as J.Key
 import qualified Data.Aeson.KeyMap as J.KeyMap
 import Data.Aeson (ToJSON (toJSON), (.=))
+-- Chapter 10: Change
+import qualified Control.Concurrent.Async as Async
 
 
 -- Chapter 1: Handles
@@ -953,3 +955,73 @@ instance Encode LByteString where
 
 instance Encode BSB.Builder where
   encode = id
+
+
+-- Chapter 10: Change
+-- Where we learn how to make the NUMBER GO UP
+--
+-- The era of stuck counters is over. It is time for side effects and
+-- maintaining state!
+
+countingServer :: IO ()
+countingServer = do
+  hitCounter <- atomically $ newTVar @Natural 0
+  serve @IO HostAny "8000" \(s, _) -> do
+    count <- atomically $ increment hitCounter
+    sendResponse s . textOk $ countHelloText count
+
+increment :: TVar Natural -> STM Natural
+increment hitCounter = do
+  oldCount <- readTVar hitCounter
+  let newCount = oldCount + 1
+  writeTVar hitCounter newCount
+  return newCount
+
+
+-- Exercises!
+--
+-- 28. Interleaving
+-- We shall go ahead and create a non-atomic version of increment. Surely this
+-- will work fine with no corner cases appearing from the woodwork :)
+incrementNotAtomic :: TVar Natural -> IO Natural
+incrementNotAtomic hitCounter = do
+  oldCount <- readTVarIO hitCounter
+  let newCount = oldCount + 1
+  atomically $ writeTVar hitCounter newCount
+  return newCount
+
+-- Oh look what might this be up to? Not sleuthing around for bugs I'm sure...
+testIncrement :: (TVar Natural -> IO a) -> IO Natural
+testIncrement inc = do
+  x <- atomically $ newTVar @Natural 0
+  Async.replicateConcurrently_ 10 (replicateM 1_000 $ inc x)
+  readTVarIO x
+-- Oh no! It turned out there were bugs regarding concurrency after all! Egads!
+
+-- 29. Times gone by
+-- Instead of a hit counter, we now implement a server that responds with the
+-- time it had been left idling without requests in between.
+timingServer :: IO ()
+timingServer = do
+  timeNow <- Time.getCurrentTime
+  timer <- newTVarIO timeNow
+  serve @IO HostAny "8000" \(s, _) -> do
+    currentTime <- Time.getCurrentTime
+    diffTime <- atomically $ requestDiffTime timer currentTime
+    sendResponse s . textOk . LT.pack $ show diffTime
+
+requestDiffTime
+  :: TVar Time.UTCTime
+  -> Time.UTCTime
+  -> STM Time.NominalDiffTime
+requestDiffTime timer currentTime = do
+  oldTime <- readTVar timer
+  let diffTime = Time.diffUTCTime currentTime oldTime
+  writeTVar timer currentTime
+  return diffTime
+-- We will note that while the book asked for a Maybe type here and that there
+-- have been no previous requests to the server so we can't really calculate
+-- that the spec was not clear on that front so I elected to treat starting of
+-- the server as the first request. It does not particularly contribute to the
+-- lesson to go through the Maybe, so I did not to rewrite based on the model
+-- solution.
