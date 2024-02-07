@@ -579,12 +579,12 @@ helloRequest = Request start [host, lang] Nothing
              (FieldValue [A.string|en, mi|])
 
 helloResponse :: Response
-helloResponse = Response status [ctype, len] body
+helloResponse = Response respStatus [ctype, len] body
   where
-    status = StatusLine
-               (Version Digit1 Digit1)
-               (StatusCode Digit2 Digit0 Digit0)
-               (Just $ ReasonPhrase [A.string|OK|])
+    respStatus = StatusLine
+                   (Version Digit1 Digit1)
+                   (StatusCode Digit2 Digit0 Digit0)
+                   (Just $ ReasonPhrase [A.string|OK|])
     ctype = Field
               (FieldName [A.string|Content-Type|])
               (FieldValue [A.string|text/plain; charset=us-ascii|])
@@ -758,17 +758,19 @@ data Status = Status StatusCode (Maybe ReasonPhrase)
 ok :: Status
 ok = Status (StatusCode Digit2 Digit0 Digit0) (Just $ ReasonPhrase [A.string|OK|])
 
--- This causes a shadowing warning
 status :: Status -> StatusLine
 status (Status code phrase) = StatusLine http_1_1 code phrase
 
 http_1_1 :: Version
 http_1_1 = Version Digit1 Digit1
 
--- And these would prefer to have type signatures
--- I might fix these in a later commit when the warnings annoy me enough
+contentType :: FieldName
 contentType = FieldName [A.string|Content-Type|]
+
+plainAscii :: FieldValue
 plainAscii = FieldValue [A.string|text/plain; charset=us-ascii|]
+
+contentLength :: FieldName
 contentLength = FieldName [A.string|Content-Length|]
 
 asciiOk :: ASCII LByteString -> Response
