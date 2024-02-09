@@ -1025,3 +1025,118 @@ requestDiffTime timer currentTime = do
 -- the server as the first request. It does not particularly contribute to the
 -- lesson to go through the Maybe, so I did not to rewrite based on the model
 -- solution.
+
+
+-- Chapter 11: Streaming
+-- Despite the pun potential, the completion of this chapter was not available
+-- as a live-feed on the internet.
+--
+-- Where we learn how to not force the entire response into memory.
+-- As in, not do what we are going to do next.
+hContentsGetResponse :: Handle -> IO Response
+hContentsGetResponse h = do
+  fileContent <- liftIO $ LBS.hGetContents h
+  let body = Just $ Body fileContent
+  return $ Response (status ok) [] body
+
+fileStrict :: IO ()
+fileStrict = do
+  dir <- getDataDir
+  serve @IO HostAny "8000" \(s, _) -> runResourceT @IO do
+    (_, h) <- binaryFileResource (dir </> "stream.txt") ReadMode
+    r <- liftIO $ hContentsGetResponse h
+    liftIO $ sendResponse s r
+-- Now that we are here, if our files remained forever small this'd be fine.
+-- Alas, they do not, so we need to be a touch more sophisticated.
+--
+-- Some RFC reading later, we arrive at...
+helloResponseStringChunked :: ByteString
+helloResponseStringChunked =
+  line [A.string|HTTP/1.1 200 OK|] <>
+  line [A.string|Content-Type: text/plain; charset=us-ascii|] <>
+  line [A.string|Transfer-Encoding: chunked|] <>
+  line [A.string||] <>
+  line [A.string|2|] <> line [A.string|He|] <>
+  line [A.string|4|] <> line [A.string|llo!|] <>
+  line [A.string|0|] <> line [A.string||]
+
+-- Anyway, I don't imagine we want to be writing chunks manually any more.
+-- What did we do before? that's right, we created data types:
+data Chunk = Chunk ChunkSize ChunkData
+newtype ChunkData = ChunkData ByteString
+newtype ChunkSize = ChunkSize Natural
+
+-- Now that we have them, let's use them.
+dataChunk :: ChunkData -> Chunk
+dataChunk chunkData = Chunk (chunkDataSize chunkData) chunkData
+
+chunkDataSize :: ChunkData -> ChunkSize
+chunkDataSize (ChunkData bs) = case toIntegralSized @Int @Natural (BS.length bs) of
+  Just n -> ChunkSize n
+  Nothing -> error $ T.pack "BS.length is always Natural"
+
+-- And of course, we need to be able to encode them.
+encodeChunk :: Chunk -> BSB.Builder
+encodeChunk (Chunk chunkSize chunkData) =
+  encodeChunkSize chunkSize <> encodeLineEnd <>
+  encodeChunkData chunkData <> encodeLineEnd
+
+encodeChunkSize :: ChunkSize -> BSB.Builder
+encodeChunkSize (ChunkSize n) = A.showIntegralHexadecimal A.LowerCase n
+
+encodeLastChunk :: BSB.Builder
+encodeLastChunk = encodeChunkSize (ChunkSize 0) <> encodeLineEnd
+
+encodeChunkData :: ChunkData -> BSB.Builder
+encodeChunkData (ChunkData cdata) = BSB.byteString cdata
+
+transferEncoding :: FieldName
+transferEncoding = FieldName [A.string|Transfer-Encoding|]
+
+chunked :: FieldValue
+chunked = FieldValue [A.string|chunked|]
+
+transferEncodingChunked :: Field
+transferEncodingChunked = Field transferEncoding chunked
+
+-- And now we make the magic happen:
+fileStreaming :: IO ()
+fileStreaming = do
+  dir <- getDataDir
+  serve @IO HostAny "8000" \(s, _) -> runResourceT @IO do
+    (_, h) <- binaryFileResource (dir </> "stream.txt") ReadMode
+    liftIO do
+      sendBSB s . encodeStatusLine $ status ok
+      sendBSB s $ encodeFieldList [transferEncodingChunked]
+      repeatUntil (BS.hGetSome h 1_024) BS.null \chunk ->
+        sendBSB s . encodeChunk . dataChunk $ ChunkData chunk
+      sendBSB s encodeLastChunk
+
+sendBSB :: Socket -> BSB.Builder -> IO ()
+sendBSB s bs = Net.sendLazy s $ BSB.toLazyByteString bs
+
+encodeFieldList :: [Field] -> BSB.Builder
+encodeFieldList xs =
+  repeatedlyEncode (\x -> encodeField x <> encodeLineEnd) xs
+  <> encodeLineEnd
+
+
+-- Exercises!
+-- 30. Tripping at the finish line
+-- Move fast and break things! Not enough line breaks? Too many? Let's see how
+-- we can break `fileStreaming` with great skill and purpose.
+--
+-- Seems that too many lines is no problem at all, but leaving some out has
+-- curl acting all confused about the connection closing while there was still
+-- outstanding data to be read, which makes sense as we break the protocol spec.
+
+-- 31. Infinite response
+-- You know, the chunks don't have to end, ever. What if...
+dawnMachineServer :: IO ()
+dawnMachineServer = do
+  serve @IO HostAny "8000" \(s, _) -> do
+    sendBSB s . encodeStatusLine $ status ok
+    sendBSB s $ encodeFieldList [transferEncodingChunked]
+    forever do
+      sendBSB s . encodeChunk . dataChunk $ ChunkData [A.string|E SUN THE SUN TH|]
+-- Supremacy: Dawn Machine is increasing...
