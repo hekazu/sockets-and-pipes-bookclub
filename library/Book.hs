@@ -46,6 +46,10 @@ import qualified Data.Aeson.KeyMap as J.KeyMap
 import Data.Aeson (ToJSON (toJSON), (.=))
 -- Chapter 10: Change
 import qualified Control.Concurrent.Async as Async
+-- Chapter 11: Streaming
+import Control.Concurrent (threadDelay)
+-- Chapter 12: Pipes
+import Pipes (Producer, Consumer, Pipe, (>->), yield, await, runEffect)
 
 
 -- Chapter 1: Handles
@@ -1140,3 +1144,157 @@ dawnMachineServer = do
     forever do
       sendBSB s . encodeChunk . dataChunk $ ChunkData [A.string|E SUN THE SUN TH|]
 -- Supremacy: Dawn Machine is increasing...
+
+
+-- Chapter 12: Pipes
+-- Where we fix some of the sacrifices previously done in the name of convenience
+--
+-- So, in the previous chapter, we wrote a program that responds, but we did not
+-- define what a response actually is. Yikes. We really ought to do something
+-- about that, shouldn't we?
+newtype MaxChunkSize = MaxChunkSize Int
+
+fileStreaming2 :: IO ()
+fileStreaming2 = do
+  dir <- getDataDir
+  serve @IO HostAny "8000" \(s, _) -> runResourceT @IO do
+    (_, h) <- binaryFileResource (dir </> "stream.txt") ReadMode
+    let r = hStreamingResponse h (MaxChunkSize 1_024)
+    liftIO $ sendStreamingResponse s r
+
+data StreamingResponse = StreamingResponse StatusLine [Field] (Maybe ChunkedBody)
+newtype ChunkedBody = ChunkedBody (Producer Chunk IO ())
+
+-- And now to get some understanding of how to use these producers, consumers,
+-- pipes and whatnot
+demoProducer :: Producer Text IO ()
+demoProducer = do
+  yield $ T.pack "one, "
+  yield $ T.pack "two, "
+  yield $ T.pack "three"
+  replicateM_ 10 do
+    liftIO $ threadDelay 100_000
+    yield $ T.pack "."
+  yield $ T.pack "GO"
+
+putTextConsumer :: Consumer Text IO ()
+putTextConsumer =
+  forever do
+    x <- await
+    putText x
+
+hStreamingResponse :: Handle -> MaxChunkSize -> StreamingResponse
+hStreamingResponse h maxChunkSize = StreamingResponse statusLine fields (Just body)
+  where
+    statusLine = status ok
+    fields = [transferEncodingChunked]
+    body = chunkedBody $ hChunks h maxChunkSize
+
+hChunks :: Handle -> MaxChunkSize -> Producer ByteString IO ()
+-- Original form:
+--
+-- hChunks h (MaxChunkSize mcs) = go
+--   where
+--     go = do
+--       chunk <- liftIO $ BS.hGetSome h mcs
+--       if BS.null chunk
+--         then return ()
+--         else do
+--           yield chunk
+--           go
+hChunks h (MaxChunkSize mcs) = produceUntil (BS.hGetSome h mcs) BS.null
+
+stringsToChunks :: Pipe ByteString Chunk IO ()
+stringsToChunks =
+  forever do
+    bs <- await
+    yield . dataChunk $ ChunkData bs
+
+chunkedBody :: Producer ByteString IO () -> ChunkedBody
+chunkedBody xs = ChunkedBody $ xs >-> stringsToChunks
+
+encodeStreamingResponse :: StreamingResponse -> Producer ByteString IO ()
+encodeStreamingResponse (StreamingResponse statusLine headers bodyMaybe) = do
+  yield $ encodeStatusLine statusLine
+  yield $ encodeFieldList headers
+
+  for_ bodyMaybe \(ChunkedBody body) -> do
+    body >-> encodeChunks
+    yield encodeLastChunk
+    yield $ encodeFieldList []
+
+  >-> build
+
+encodeChunks :: Pipe Chunk BSB.Builder IO ()
+encodeChunks =
+  forever do
+    chunk <- await
+    yield $ encodeChunk chunk
+
+build :: Pipe BSB.Builder ByteString IO ()
+build = forever do
+  bsb <- await
+  let chunks = LBS.toChunks $ BSB.toLazyByteString bsb
+  for_ chunks yield
+
+sendStreamingResponse :: Socket -> StreamingResponse -> IO ()
+sendStreamingResponse s r = runEffect @IO $ encodeStreamingResponse r >-> toSocket s
+
+-- Exercises!
+--
+-- 32. Into the socket
+-- Write the consumer `toSocket` so that te above function works
+toSocket :: Socket -> Consumer ByteString IO ()
+toSocket s = forever do
+  bs <- await
+  liftIO $ Net.send s bs
+
+-- 33. Produce until
+-- You know the drill! We have done these generic "do something until x"
+-- functions a couple times now. Time to write a Producer!
+produceUntil :: IO chunk -> (chunk -> Bool) -> Producer chunk IO ()
+produceUntil chunker isEnd = go
+  where
+    go = do
+      chunk <- liftIO chunker
+      if isEnd chunk
+        then return ()
+        else
+          yield chunk >> go
+-- And now that we are here, we'll go ahead and rewrite `hChunks`. See above!
+
+-- 34. File copying
+-- In chapter 3, we had `copyGreetingFile`. Let's make that a stream!
+copyGreetingStream :: IO ()
+copyGreetingStream = runResourceT do
+  dir <- liftIO getDataDir
+  (_, h1) <- binaryFileResource (dir </> "greeting.txt") ReadMode
+  (_, h2) <- binaryFileResource (dir </> "greeting2.txt") WriteMode
+  liftIO $ hCopy h1 h2
+
+-- This `hCopy` here is the part we supply (mostly) ourselves
+hCopy :: Handle -> Handle -> IO ()
+hCopy source destination = runEffect @IO (producer >-> consumer)
+  where
+    producer = hChunks source $ MaxChunkSize 1_024
+    consumer = forever do
+      chunk <- await
+      liftIO $ BS.hPutStr destination chunk
+
+-- 35. Copying to multiple destinations
+-- Repeat previous, but with some chest hair!
+fileCopyMany :: FilePath -> [FilePath] -> IO ()
+fileCopyMany source destinations = runResourceT do
+  (_, hSource) <- binaryFileResource source ReadMode
+  hDestinations <- forM destinations \fp -> do
+    (_, h) <- binaryFileResource fp WriteMode
+    return h
+  liftIO $ hCopyMany hSource hDestinations
+
+hCopyMany :: Handle -> [Handle] -> IO ()
+hCopyMany source destinations = runEffect @IO (producer >-> consumer)
+  where
+    producer = hChunks source $ MaxChunkSize 1_024
+    consumer = forever do
+      chunk <- await
+      liftIO $ mapM (flip BS.hPutStr chunk) destinations
