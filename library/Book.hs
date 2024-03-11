@@ -50,6 +50,11 @@ import qualified Control.Concurrent.Async as Async
 import Control.Concurrent (threadDelay)
 -- Chapter 12: Pipes
 import Pipes (Producer, Consumer, Pipe, (>->), yield, await, runEffect)
+-- Chapter 13: Parsing
+import qualified Data.Map.Strict as Map
+import qualified Data.Attoparsec.ByteString as P
+import qualified Data.Attoparsec.ByteString.Run as P
+import Data.Attoparsec.ByteString (Parser, (<?>))
 
 
 -- Chapter 1: Handles
@@ -547,24 +552,24 @@ queryHaskellDotOrg = runResourceT do
 -- Chapter 6: HTTP Types
 --
 -- Where we take a moment to represent HTTP as Haskell types
-data Request = Request RequestLine [Field] (Maybe Body)
-data Response = Response StatusLine [Field] (Maybe Body)
+data Request = Request RequestLine [Field] (Maybe Body) deriving Show
+data Response = Response StatusLine [Field] (Maybe Body) deriving (Eq, Show)
 
-data RequestLine = RequestLine Method RequestTarget Version
-data Method = Method (ASCII ByteString)
-data RequestTarget = RequestTarget (ASCII ByteString)
-data Version = Version Digit Digit
+data RequestLine = RequestLine Method RequestTarget Version deriving Show
+data Method = Method (ASCII ByteString) deriving Show
+data RequestTarget = RequestTarget (ASCII ByteString) deriving Show
+data Version = Version Digit Digit deriving (Eq, Show)
 
-data StatusLine = StatusLine Version StatusCode (Maybe ReasonPhrase)
-data StatusCode = StatusCode Digit Digit Digit
-data ReasonPhrase = ReasonPhrase (ASCII ByteString)
+data StatusLine = StatusLine Version StatusCode (Maybe ReasonPhrase) deriving (Eq, Show)
+data StatusCode = StatusCode Digit Digit Digit deriving (Eq, Show)
+data ReasonPhrase = ReasonPhrase (ASCII ByteString) deriving (Eq, Show)
 
-data Field = Field FieldName FieldValue
-data FieldName = FieldName (ASCII ByteString)
-data FieldValue = FieldValue (ASCII ByteString)
+data Field = Field FieldName FieldValue deriving (Eq, Show)
+data FieldName = FieldName (ASCII ByteString) deriving (Eq, Show)
+data FieldValue = FieldValue (ASCII ByteString) deriving (Eq, Show)
 
 -- Relude at play here with a type alias
-data Body = Body LByteString
+data Body = Body LByteString deriving (Eq, Show)
 
 -- Exercises!
 -- 18. Construct some values
@@ -1298,3 +1303,214 @@ hCopyMany source destinations = runEffect @IO (producer >-> consumer)
     consumer = forever do
       chunk <- await
       liftIO $ mapM (flip BS.hPutStr chunk) destinations
+
+
+-- Chapter 13: Parsing
+--
+-- We probably should also read the messages we are sent, huh?
+newtype ResourceName = ResourceName Text deriving (Eq, Ord)
+newtype ResourceMap = ResourceMap (Map ResourceName FilePath)
+
+resourceMap :: FilePath -> ResourceMap
+resourceMap dir = ResourceMap $ Map.fromList
+  [ (streamResource, dir </> "stream.txt"),
+    (readResource, dir </> "read.txt")
+  ]
+
+streamResource :: ResourceName
+streamResource = ResourceName $ T.pack "/stream"
+
+readResource :: ResourceName
+readResource = ResourceName $ T.pack "/read"
+
+-- Attoparsec tutorial time! Let's do some examples before diving into our deep
+-- end of things, to get our bearings and all.
+-- Most of the demoing was in REPL, but these help if one wants to rerun them :)
+countString :: ByteString
+countString = [A.string|one-two-three-four|]
+
+takeTwoWords :: Parser (ByteString, ByteString)
+takeTwoWords = do
+  a <- P.takeWhile A.isLetter
+  _ <- P.string $ A.fromCharList [A.HyphenMinus]
+  b <- P.takeWhile A.isLetter
+  return (a,b)
+
+-- Back to it!
+spaceParser :: Parser ByteString
+spaceParser = P.string $ A.fromCharList [A.Space]
+
+lineEndParser :: Parser ByteString
+lineEndParser = P.string $ A.fromCharList crlf
+
+requestLineParser :: Parser RequestLine
+requestLineParser = do
+  method <- methodParser <?> "Method"
+  _ <- spaceParser <|> fail "Method should be followed by a space"
+  target <- requestTargetParser <?> "Target"
+  _ <- spaceParser <|> fail "Target should be followed by a space"
+  version <- versionParser <?> "Version"
+  _ <- lineEndParser <|> fail "Version should be followed by end of line"
+  return $ RequestLine method target version
+
+methodParser :: Parser Method
+-- We do a little trolling (this was a more approachable `do` block)
+methodParser = Method <$> tokenParser
+
+tokenParser :: Parser (ASCII ByteString)
+tokenParser = do
+  bs <- P.takeWhile1 isTchar
+  case A.convertStringMaybe bs of
+    Just asciiBS -> return asciiBS
+    Nothing -> fail "Non-ASCII tchar"
+
+isTchar :: Word8 -> Bool
+isTchar c = elem c tcharSymbols || A.isDigit c || A.isLetter c
+
+tcharSymbols :: [Word8]
+tcharSymbols = A.fromCharList [ A.ExclamationMark, A.NumberSign, A.DollarSign,
+  A.PercentSign, A.Ampersand, A.Apostrophe, A.Asterisk, A.PlusSign, A.HyphenMinus,
+  A.FullStop, A.Caret, A.Underscore, A.GraveAccent, A.VerticalLine, A.Tilde ]
+
+-- We will leave this slightly incomplete, i.e. not fully spec compliant as this
+-- is a tutorial book, not a painstaking effort to write a full HTTP library
+requestTargetParser :: Parser RequestTarget
+requestTargetParser = do
+  bs <- P.takeWhile1 A.isVisible
+  case A.convertStringMaybe bs of
+    Just asciiBS -> return $ RequestTarget asciiBS
+    Nothing -> fail "Non-ASCII vchar"
+
+versionParser :: Parser Version
+versionParser = do
+  _ <- P.string [A.string|HTTP|] <|> fail "Should start with HTTP"
+  _ <- P.string (A.fromCharList [A.Slash]) <|> fail "HTTP should be followed by a slash"
+  x <- digitParser <?> "First digit"
+  _ <- P.string (A.fromCharList [A.FullStop]) <|> fail "Major and minor version numbers should be separated by a full stop"
+  y <- digitParser <?> "Second digit"
+  return $ Version x y
+
+digitParser :: Parser Digit
+digitParser = do
+  x <- P.anyWord8
+  case A.word8ToDigitMaybe x of
+    Just d -> return d
+    Nothing -> fail "0-9 expected"
+-- Then we added context to `requestLineParser` via `(<?>)` and `(<|>)`
+
+-- Anyway, time to actually do the incremental parsing thing we picked
+-- the Attoparsec library for!
+newtype Input = Input (P.RestorableInput IO ByteString)
+
+parseFromSocket :: Socket -> MaxChunkSize -> IO Input
+parseFromSocket s (MaxChunkSize mcs) = Input <$> P.newRestorableIO (S.recv s mcs)
+
+readRequestLine :: Input -> IO RequestLine
+readRequestLine (Input i) = do
+  result <- P.parseAndRestore i (requestLineParser <?> "Request line")
+  case result of
+    Left parseError -> fail $ P.showParseError parseError
+    Right requestLine -> return requestLine
+
+resourceServer :: IO ()
+resourceServer = do
+  dir <- getDataDir
+  let resources = resourceMap dir
+  let maxChunkSize = MaxChunkSize 1_024
+  serve @IO HostAny "8000" \(s, _) -> serveResourceOnce resources maxChunkSize s
+
+serveResourceOnce :: ResourceMap -> MaxChunkSize -> Socket -> IO ()
+serveResourceOnce resources maxChunkSize s = runResourceT @IO do
+  i <- liftIO $ parseFromSocket s maxChunkSize
+  RequestLine _ target _ <- liftIO $ readRequestLine i
+  filePath <- liftIO $ getTargetFilePath resources target
+  (_, h) <- binaryFileResource filePath ReadMode
+  let r = hStreamingResponse h maxChunkSize
+  liftIO $ sendStreamingResponse s r
+
+getTargetFilePath :: ResourceMap -> RequestTarget -> IO FilePath
+getTargetFilePath rs target =
+  case targetFilePathMaybe rs target of
+    Nothing -> fail "not found"
+    Just fp -> return fp
+
+targetFilePathMaybe :: ResourceMap -> RequestTarget -> Maybe FilePath
+targetFilePathMaybe (ResourceMap rs) (RequestTarget target) = Map.lookup r rs
+  where
+    r = ResourceName $ A.asciiByteStringToText target
+
+
+-- Exercises!
+--
+-- 36. Parsing parentheses
+-- It is time to bring `unParen` (ex. 6) to this day and age of parsers!
+parenParser :: Parser ByteString
+parenParser = do
+  _ <- parseOpeningParen
+  content <- parseNonParen
+  _ <- parseClosingParen
+  return content
+    where
+      parseOpeningParen = P.word8 $ A.toWord8 A.LeftParenthesis
+      parseNonParen = P.takeTill (== A.toWord8 A.RightParenthesis)
+      parseClosingParen = P.word8 $ A.toWord8 A.RightParenthesis
+-- There are still very much not nice corner cases here, but it matches the
+-- model solution and clears the example so who am I to complain?
+
+-- 37. To digit, maybe
+-- Rewrite `digitParser` without partial functions
+
+-- 38. Better parse errors
+-- We revised Version parsing to be nicer
+
+-- 39. Status line
+-- Let's write a parser for responses too, for a laugh
+statusLineParser :: Parser StatusLine
+statusLineParser = do
+  version <- versionParser
+  _ <- spaceParser
+  statusCode <- statusCodeParser
+  _ <- spaceParser
+  reason <- reasonPhraseParser
+  _ <- lineEndParser
+  return $ StatusLine version statusCode reason
+    where
+      statusCodeParser = do
+        x <- digitParser
+        y <- digitParser
+        z <- digitParser
+        return $ StatusCode x y z
+      reasonPhraseParser = do
+        potentialPhrase <- P.takeWhile isWithinReason
+        if BS.null potentialPhrase
+          then return Nothing
+          else do
+            x <- A.convertStringOrFail potentialPhrase
+            return . Just $ ReasonPhrase x
+
+      isWithinReason :: Word8 -> Bool
+      isWithinReason c = c `elem` map A.fromChar [A.HorizontalTab, A.Space] || A.isVisible c
+
+statusLineParseTest :: StatusLine -> Maybe String
+statusLineParseTest statusLine = do
+  let encodedSL = BS.toStrict . BSB.toLazyByteString $ encodeStatusLine statusLine
+  case P.parseOnlyStrict encodedSL (statusLineParser <* P.endOfInput) of
+    Left err -> Just $ P.showParseError err
+    Right x' | statusLine /= x' -> Just $ show x'
+    Right _ -> Nothing
+-- I did not enjoy this exercise. There were several gotchas involved in it
+-- that had not been discussed in the chapter.
+
+-- 40. P.string
+-- Suppose we did not have `P.string`. Could we make do?
+scuffedStringParser :: ByteString -> Parser ByteString
+scuffedStringParser bs
+  | BS.null bs = return BS.empty
+  | otherwise =
+      case BS.uncons bs of
+        Nothing -> fail "Predicate longer than string"
+        Just (w8,req) -> do
+          w8' <- P.anyWord8
+          if w8 == w8'
+            then BS.cons w8' <$> scuffedStringParser req
+            else fail "Did not meet predicate!"
