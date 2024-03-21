@@ -55,6 +55,8 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Attoparsec.ByteString as P
 import qualified Data.Attoparsec.ByteString.Run as P
 import Data.Attoparsec.ByteString (Parser, (<?>))
+-- Chapter 14: Errors
+import Unfork (unforkAsyncIO_)
 
 
 -- Chapter 1: Handles
@@ -556,7 +558,7 @@ data Request = Request RequestLine [Field] (Maybe Body) deriving Show
 data Response = Response StatusLine [Field] (Maybe Body) deriving (Eq, Show)
 
 data RequestLine = RequestLine Method RequestTarget Version deriving Show
-data Method = Method (ASCII ByteString) deriving Show
+data Method = Method (ASCII ByteString) deriving (Eq, Show)
 data RequestTarget = RequestTarget (ASCII ByteString) deriving Show
 data Version = Version Digit Digit deriving (Eq, Show)
 
@@ -1514,3 +1516,196 @@ scuffedStringParser bs
           if w8 == w8'
             then BS.cons w8' <$> scuffedStringParser req
             else fail "Did not meet predicate!"
+
+
+-- Chapter 14: Errors
+-- Where we admit we should tell the client if they, or worse yet us, have done
+-- something wrong in the process of replying.
+badRequest :: Status
+badRequest = Status
+  (StatusCode Digit4 Digit0 Digit0)
+  (Just $ ReasonPhrase [A.string|Bad request|])
+
+notFound :: Status
+notFound = Status
+  (StatusCode Digit4 Digit0 Digit4)
+  (Just $ ReasonPhrase [A.string|Not found|])
+
+serverError :: Status
+serverError = Status
+  (StatusCode Digit5 Digit0 Digit0)
+  (Just $ ReasonPhrase [A.string|Server error|])
+
+methodNotAllowed :: Status
+methodNotAllowed = Status
+  (StatusCode Digit4 Digit0 Digit5)
+  (Just $ ReasonPhrase [A.string|Method not allowed|])
+
+versionNotSupported :: Status
+versionNotSupported = Status
+  (StatusCode Digit5 Digit0 Digit5)
+  (Just $ ReasonPhrase [A.string|HTTP version not supported|])
+
+textResponse :: Status -> [Field] -> LText -> Response
+textResponse s additionalFields bodyText =
+  Response (status s)
+           ([typ, len] <> additionalFields)
+           (Just body)
+  where
+    typ = Field contentType plainUtf8
+    len = Field contentLength $ bodyLengthValue body
+    body = Body $ LT.encodeUtf8 bodyText
+
+newtype LogEvent = LogEvent LText
+
+printLogEvent :: LogEvent -> IO ()
+printLogEvent (LogEvent x) = LT.putStrLn x
+
+data Error = Error (Maybe Response) [LogEvent]
+
+handleRequestError :: (LogEvent -> IO b) -> Socket -> Error -> IO ()
+handleRequestError log s (Error responseMaybe events) = do
+  for_ events log
+  for_ responseMaybe (sendResponse s)
+
+requestParseError :: P.ParseError -> Error
+requestParseError parseError = Error (Just response) [event]
+  where
+    response = textResponse badRequest [] message
+    event = LogEvent message
+    message = TB.toLazyText (
+      TB.fromString "Malformed request: " <>
+      TB.fromString (P.showParseError parseError))
+
+notFoundError :: Error
+notFoundError = Error (Just response) []
+  where
+    response = textResponse notFound [] message
+    message = LT.pack "It just isnt there!"
+
+methodError :: [Method] -> Error
+methodError supportedMethods = Error (Just response) []
+  where
+    response = textResponse methodNotAllowed [allowField supportedMethods] LT.empty
+
+allowField :: [Method] -> Field
+allowField methods = Field (FieldName [A.string|Allow|]) value
+  where
+    value = FieldValue . commaList $ map (\(Method m) -> m) methods
+    commaList xs = fold $ intersperse (A.fromCharList [A.Comma, A.Space]) xs
+
+fileOpenError :: FilePath -> SomeException -> Error
+fileOpenError filePath ex = Error (Just response) [event]
+  where
+    response = textResponse serverError [] $ LT.pack "Something went wrong."
+    event = LogEvent . TB.toLazyText $
+      TB.fromString "Failed to open file " <>
+      TB.fromString (show filePath) <> TB.fromString ": " <>
+      TB.fromString (displayException ex)
+
+ungracefulError :: SomeException -> Error
+ungracefulError e = Error Nothing [event]
+  where
+    event = LogEvent . LT.pack $ displayException e
+
+handleIOExceptions :: IO (Either Error a) -> IO (Either Error a)
+handleIOExceptions action = do
+  result <- tryAny action
+  case result of
+    Left e -> return . Left $ ungracefulError e
+    Right x -> return x
+
+-- And now, let us handle them errors unlike in the past!
+getTargetFilePathX :: ResourceMap -> RequestTarget -> Either Error FilePath
+getTargetFilePathX rs t =
+  case targetFilePathMaybe rs t of
+    Nothing -> Left notFoundError
+    Just fp -> Right fp
+
+readRequestLineX :: Input -> IO (Either Error RequestLine)
+readRequestLineX i = readRequestPart i "Request line" requestLineParser
+
+-- Let's generalise the above a bit. Bound to be useful! At least we can
+-- go ahead and refactor it to be all fancy-like next!
+readRequestPart :: Input -> String -> Parser a -> IO (Either Error a)
+readRequestPart (Input i) description p = do
+  result <- liftIO (P.parseAndRestore i (p <?> description))
+  case result of
+    Left e -> return . Left $ requestParseError e
+    Right requestLine -> return $ Right requestLine
+
+binaryFileResourceX
+  :: FilePath
+  -> IOMode
+  -> ResourceT IO (Either Error (ReleaseKey, Handle))
+binaryFileResourceX fp mode = do
+  result <- tryAny $ binaryFileResource fp mode
+  case result of
+    Left e -> return . Left $ fileOpenError fp e
+    Right x -> return $ Right x
+
+requireMethodX :: [Method] -> Method -> Either Error ()
+requireMethodX supportedMethods x
+  | x `elem` supportedMethods = Right ()
+  | otherwise = Left $ methodError supportedMethods
+
+-- This just was not in the book, did it myself ":D"
+sendStreamingResponseX :: Socket -> StreamingResponse -> IO (Either Error ())
+sendStreamingResponseX s r = do
+  sent <- tryAny . runEffect @IO $ encodeStreamingResponse r >-> toSocket s
+  case sent of
+    Left e -> return . Left $ ungracefulError e
+    Right () -> return $ Right ()
+
+serveResourceOnceX :: ResourceMap -> MaxChunkSize -> Socket -> IO (Either Error ())
+serveResourceOnceX resources maxChunkSize s =
+  handleIOExceptions . runResourceT @IO $ runExceptT @Error @(ResourceT IO) do
+    i <- liftIO $ parseFromSocket s maxChunkSize
+    RequestLine method target version <- ExceptT . liftIO $ readRequestLineX i
+    ExceptT . return $ requireMethodX [Method [A.string|GET|]] method
+    ExceptT . return $ requireVersionX http_1_1 version
+    fp <- ExceptT . return $ getTargetFilePathX resources target
+    (_, h) <- ExceptT $ binaryFileResourceX fp ReadMode
+    let r = hStreamingResponse h maxChunkSize
+    ExceptT . liftIO $ sendStreamingResponseX s r
+
+-- Exercises!
+--
+-- 41. Resource Server X
+-- Let us write `resourceServerX`
+resourceServerX :: IO ()
+resourceServerX = do
+  dir <- getDataDir
+  let resources = resourceMap dir
+  let maxChunkSize = MaxChunkSize 1_024
+  unforkAsyncIO_ printLogEvent \log ->
+    serve @IO HostAny "8000" \(s, _) -> do
+      served <- serveResourceOnceX resources maxChunkSize s
+      case served of
+        Left e -> handleRequestError log s e
+        Right _ -> return ()
+
+-- 42. Check method and HTTP version
+-- Write the function below, then add it and `requireMethodX` to
+-- `serveResourceOnceX` for completeness
+requireVersionX :: Version -> Version -> Either Error ()
+requireVersionX supportedVersion requestVersion =
+  if supportedVersion == requestVersion
+    then Right ()
+    else Left badRequestVersion
+
+badRequestVersion :: Error
+badRequestVersion = Error (Just response) []
+  where
+    response = textResponse versionNotSupported [] $ LT.pack "Sorry, HTTP/1.1 only"
+
+-- 43. A sinister request
+-- Where we make a request that sucks. A HTTP client that absolutely fails at
+-- its job. A completely bungled up mess. The aim is to generate a response with
+-- the status code 400.
+sendSinisterRequest :: IO ()
+sendSinisterRequest = runResourceT @IO do
+  addrInfo <- liftIO $ resolve "8000" "localhost"
+  (_, s) <- openAndConnect addrInfo
+  Net.send s [A.string|POST /oispa kaljaa|]
+  liftIO $ repeatUntilNothing (Net.recv s 1_024) BS.putStr
