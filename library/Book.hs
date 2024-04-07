@@ -25,7 +25,7 @@ import qualified ASCII.Char as A
 import Network.Simple.TCP (serve, HostPreference (..))
 import qualified Network.Simple.TCP as Net
 -- Chapter 6: HTTP Types
-import ASCII (ASCII)
+import ASCII (ASCII, ASCII'lower)
 import ASCII.Decimal (Digit(..))
 import qualified Data.ByteString.Lazy as LBS
 -- Chapter 7: Encoding
@@ -57,6 +57,11 @@ import qualified Data.Attoparsec.ByteString.Run as P
 import Data.Attoparsec.ByteString (Parser, (<?>))
 -- Chapter 14: Errors
 import Unfork (unforkAsyncIO_)
+-- Chapter 16: Context
+import Control.Monad.Trans.Resource (MonadResource, liftResourceT)
+import Control.Monad.Except (MonadError, liftEither, throwError)
+import qualified HashAddressed.Directory as HashAddressed
+import qualified HashAddressed.HashFunction as HashAddressed
 
 
 -- Chapter 1: Handles
@@ -1709,3 +1714,525 @@ sendSinisterRequest = runResourceT @IO do
   (_, s) <- openAndConnect addrInfo
   Net.send s [A.string|POST /oispa kaljaa|]
   liftIO $ repeatUntilNothing (Net.recv s 1_024) BS.putStr
+
+
+-- Chapter 15. Reading fields
+-- You didn't think just reading the request line would be sufficient, did you?
+--
+-- We shall approach this topic by making our server multilingual.
+acceptLanguage :: FieldName
+acceptLanguage = FieldName [A.string|Accept-Language|]
+
+newtype Language = Language (ASCII ByteString) deriving (Eq, Ord)
+-- Added ASCII'lower to imports of ASCII
+newtype LanguageCI = LanguageCI (ASCII'lower ByteString) deriving (Eq, Ord)
+
+english :: LanguageCI
+english = LanguageCI [A.lower|en|]
+french :: LanguageCI
+french = LanguageCI [A.lower|fr|]
+japanese :: LanguageCI
+japanese = LanguageCI [A.lower|ja|]
+
+languageCI :: Language -> LanguageCI
+languageCI (Language x) = LanguageCI $ A.refineStringToCase x
+
+languageLowerCase :: LanguageCI -> Language
+languageLowerCase (LanguageCI x) = Language $ A.forgetCase x
+
+data Translation = Translation ResourceName LanguageCI deriving (Eq, Ord)
+newtype LanguageMap = LanguageMap (Map Translation FilePath)
+
+languageMap :: FilePath -> LanguageMap
+languageMap dir = LanguageMap $ Map.fromList
+  [ (Translation streamResource english, dir </> "stream.txt")
+  , (Translation readResource english, dir </> "read.txt")
+  , (Translation streamResource french, dir </> "stream-fr.txt")
+  , (Translation readResource japanese, dir </> "read-ja.txt")
+  ]
+
+isWhitespace :: Word8 -> Bool
+isWhitespace x = elem x $ fmap A.fromChar [A.Space, A.HorizontalTab]
+
+listParser :: Parser a -> Parser [a]
+listParser elementParser = do
+  x <- optional elementParser
+  xs <- many do
+    _ <- P.takeWhile isWhitespace
+    _ <- P.string $ A.fromCharList [A.Comma]
+    _ <- P.takeWhile isWhitespace
+    optional elementParser
+  return $ catMaybes (x:xs)
+
+acceptLanguageParser :: Parser [(Language, Quality)]
+acceptLanguageParser = listParser do
+  language <- languageParser
+  weight <- optionalWeightParser
+  return (language, weight)
+
+languageParser :: Parser Language
+languageParser = do
+  x <- P.takeWhile1 isLanguageChar
+  y <- A.convertStringOrFail x
+  return $ Language y
+
+isLanguageChar :: Word8 -> Bool
+isLanguageChar w = case A.toCharMaybe w of
+  Just c | A.isAlphaNum c -> True
+  Just A.HyphenMinus -> True
+  Just A.Asterisk -> True
+  _ -> False
+
+data Quality = Quality Digit Digit Digit Digit deriving (Eq, Ord)
+
+fieldListParser :: Parser [Field]
+fieldListParser = many do
+  x <- fieldParser <?> "field"
+  _ <- lineEndParser <|> fail "field line should be followed by end of line"
+  return x
+
+wordsParser :: Parser [ByteString]
+wordsParser = do
+  x <- P.takeWhile1 A.isVisible
+  xs <- many do
+    _ <- P.takeWhile1 isWhitespace
+    P.takeWhile1 A.isVisible
+  return (x:xs)
+
+fieldValueParser :: Parser FieldValue
+fieldValueParser = do
+  (x, _) <- P.match wordsParser
+  y <- A.convertStringOrFail x
+  return $ FieldValue y
+
+newtype FieldNameCI = FieldNameCI (ASCII'lower ByteString) deriving (Eq, Ord)
+fieldNameCI :: FieldName -> FieldNameCI
+fieldNameCI (FieldName x) = FieldNameCI $ A.refineStringToCase x
+
+newtype FieldMap = FieldMap (Map FieldNameCI ByteString)
+
+newtype FieldMapBuilder = FieldMapBuilder (Map FieldNameCI BSB.Builder)
+instance Semigroup FieldMapBuilder where
+  FieldMapBuilder m1 <> FieldMapBuilder m2 =
+    FieldMapBuilder $ Map.unionWith commaConcat m1 m2
+    where
+      commaConcat a b = a <> [A.string|, |] <> b
+
+instance Monoid FieldMapBuilder where
+  mempty = FieldMapBuilder mempty
+
+fieldMapBuilderSingleton :: Field -> FieldMapBuilder
+fieldMapBuilderSingleton (Field name (FieldValue v)) =
+  FieldMapBuilder $ Map.singleton (fieldNameCI name) (BSB.byteString (A.lift v))
+
+fieldMapFromList :: [Field] -> FieldMap
+fieldMapFromList fields = FieldMap $ fmap (LBS.toStrict . BSB.toLazyByteString) m
+  where
+    FieldMapBuilder m = foldMap fieldMapBuilderSingleton fields
+
+data FieldResult a = FieldMissing | FieldInvalid P.ParseError | FieldOkay a
+
+readField :: FieldNameCI -> Parser a -> FieldMap -> FieldResult a
+readField name p (FieldMap m) = case Map.lookup name m of
+  Nothing -> FieldMissing
+  Just v -> do
+    let p' = (p <* P.endOfInput) <?> fieldNameCIToString name
+    case P.parseOnlyStrict v p' of
+      Left e -> FieldInvalid e
+      Right x -> FieldOkay x
+
+fieldNameCIToString :: FieldNameCI -> String
+fieldNameCIToString (FieldNameCI bs) = A.toUnicodeCharList bs
+
+contentLanguage :: FieldName
+contentLanguage = FieldName [A.string|Content-Language|]
+
+contentLanguageField :: Language -> Field
+contentLanguageField (Language x) = Field contentLanguage $ FieldValue x
+
+overFields :: ([Field] -> [Field]) -> StreamingResponse -> StreamingResponse
+overFields f (StreamingResponse start fields body) =
+  StreamingResponse start (f fields) body
+
+-- Exercises!
+-- 44. Field parser
+-- So we are missing `fieldParser` and `fieldNameParser`. We ought not to.
+fieldParser :: Parser Field
+fieldParser = do
+  name <- fieldNameParser <?> "field-name"
+  _ <- P.string (A.fromCharList [A.Colon]) <|>
+         fail "Field name should be followed by a colon"
+  _ <- P.takeWhile isWhitespace <?> "optional whitespace"
+  value <- fieldValueParser <?> "field-value"
+  _ <- P.takeWhile isWhitespace <?> "optional whitespace"
+  return $ Field name value
+
+fieldNameParser :: Parser FieldName
+fieldNameParser = FieldName <$> tokenParser
+
+-- 45. High quality parsing
+-- Okay so we kinda neglected to do Qualities. Let us fix that. Yup. First
+-- we fill in the Quality data type. Then we do some parsers.
+qualityValueParser :: Parser Quality
+qualityValueParser = do
+  leadCharacter <- digitParser
+  case leadCharacter of
+    Digit1 -> do
+      _ <- P.string $ A.fromCharList [A.FullStop]
+      firstDigit <- digitParser <|> return Digit0
+      secondDigit <- digitParser <|> return Digit0
+      thirdDigit <- digitParser <|> return Digit0
+      if all (==Digit0) [firstDigit, secondDigit, thirdDigit]
+        then return defaultWeight
+        else fail "No values greater than 1 accepted as weight"
+    Digit0 -> do
+      _ <- P.string $ A.fromCharList [A.FullStop]
+      firstDigit <- digitParser <|> return Digit0
+      secondDigit <- digitParser <|> return Digit0
+      thirdDigit <- digitParser <|> return Digit0
+      return $ Quality Digit0 firstDigit secondDigit thirdDigit
+    _ -> fail "Quality weight should start with 0 or 1"
+
+weightParser :: Parser Quality
+weightParser = do
+  _ <- P.takeWhile isWhitespace
+  _ <- P.string $ A.fromCharList [A.Semicolon]
+  _ <- P.takeWhile isWhitespace
+  _ <- P.string [A.string|q=|]
+  qualityValueParser
+
+optionalWeightParser :: Parser Quality
+optionalWeightParser = weightParser <|> return defaultWeight
+
+defaultWeight :: Quality
+defaultWeight = Quality Digit1 Digit0 Digit0 Digit0
+
+-- 46. Sorting by preference
+-- Let us define the following function where we gather the client's preferred
+-- languages in order of preference.
+getAcceptedLanguages :: FieldMap -> [LanguageCI]
+getAcceptedLanguages fm =
+  let
+    lookupfield = fieldNameCI acceptLanguage
+    fieldResult = readField lookupfield acceptLanguageParser fm
+  in
+    case fieldResult of
+      FieldMissing -> []
+      FieldInvalid _ -> []
+      FieldOkay langs ->
+        map (languageCI . fst) $ sortBy (comparing (Down . snd)) langs
+
+-- 47. Multilingual lookup
+-- Define `polyglotPathMaybe` (given: Type declaration)
+polyglotPathMaybe :: LanguageMap -> FieldMap -> RequestTarget -> Maybe (Language, FilePath)
+polyglotPathMaybe (LanguageMap lm) fm (RequestTarget rt) =
+  let
+    userpreferences = getAcceptedLanguages fm ++ [english]
+    resourcename = ResourceName $ A.asciiByteStringToText rt
+    availableresources = map mapToResource userpreferences
+    mapToResource :: LanguageCI -> Maybe (Language, FilePath)
+    mapToResource langCI = case Map.lookup (Translation resourcename langCI) lm of
+      Just path -> Just (languageLowerCase langCI, path)
+      Nothing -> Nothing
+  in
+    asum availableresources
+
+-- 48. The polyglot server
+-- Let us now create the server that actually serves multilingual responses
+-- (Heaven help us, we are given naught but the type signature)
+polyglotServer :: IO a
+polyglotServer = do
+  dir <- getDataDir
+  let resources = languageMap dir
+  let maxChunkSize = MaxChunkSize 1_024
+  unforkAsyncIO_ printLogEvent \log ->
+    serve @IO HostAny "8000" \(s, _) -> do
+      served <- serveLanguageResourceOnce resources maxChunkSize s
+      case served of
+        Left e -> handleRequestError log s e
+        Right _ -> return ()
+
+serveLanguageResourceOnce :: LanguageMap -> MaxChunkSize -> Socket -> IO (Either Error ())
+serveLanguageResourceOnce resources maxChunkSize s =
+  handleIOExceptions . runResourceT @IO $ runExceptT @Error @(ResourceT IO) do
+    i <- liftIO $ parseFromSocket s maxChunkSize
+    RequestLine method target version <- ExceptT . liftIO $ readRequestLineX i
+    ExceptT . return $ requireMethodX [Method [A.string|GET|]] method
+    ExceptT . return $ requireVersionX http_1_1 version
+    fieldlist <- ExceptT . liftIO $ readFieldListPart i
+    let fieldmap = fieldMapFromList fieldlist
+    (lang, fp) <- ExceptT . return . orElse notFoundError $ polyglotPathMaybe resources fieldmap target
+    (_, h) <- ExceptT $ binaryFileResourceX fp ReadMode
+    let r = addLanguageField (languageCI lang) $ hStreamingResponse h maxChunkSize
+    ExceptT . liftIO $ sendStreamingResponseX s r
+
+readFieldListPart :: Input -> IO (Either Error [Field])
+readFieldListPart i = readRequestPart i "Field list" fieldListParser
+
+orElse :: e -> Maybe a -> Either e a
+orElse _ (Just x) = Right x
+orElse e Nothing = Left e
+
+addLanguageField :: LanguageCI -> StreamingResponse -> StreamingResponse
+addLanguageField language = overFields (field :)
+  where
+    field = contentLanguageField $ languageLowerCase language
+
+-- 49. Kinds of repetition
+-- We get `optional`, `many` and `sepBy` from `base` and `attoparsec`. But
+-- what if we didn't? Could we define them ourselves?
+optionalExercise :: Parser a -> Parser (Maybe a)
+optionalExercise parser = something <|> return Nothing
+  where
+    something = Just <$> parser
+
+manyExercise :: Parser a -> Parser [a]
+manyExercise parser = something <|> pure []
+  where
+    something = do
+      x <- parser
+      xs <- manyExercise parser
+      return $ x:xs
+
+sepByExercise :: Parser a -> Parser sep -> Parser [a]
+sepByExercise content separator = something <|> pure []
+  where
+    something = do
+      x <- content
+      xs <- many do
+        _ <- separator
+        content
+      return $ x:xs
+
+-- 50. Many of nothing
+-- We want to read a list of numbers where they are separated by any number
+-- of spaces and treat those spaces as the number zero. We are given an attempt
+-- at the problem that is not working. Pls to fix.
+numbersAndBlanksParser :: Parser [Integer]
+numbersAndBlanksParser = many (numberParser <|> zero)
+  where
+    zero = do
+      _ <- P.takeWhile1 isWhitespace
+      return 0
+
+number1, number2, number3, numberParser :: Parser Integer
+number1 = do
+  _ <- P.string [A.string|One!|]
+  return 1
+number2 = do
+  _ <- P.string [A.string|Two!|]
+  return 2
+number3 = do
+  _ <- P.string [A.string|Three!|]
+  return 3
+numberParser = number1 <|> number2 <|> number3 <|> fail "number"
+
+
+-- Chapter 16: Context
+-- We wrap our miscellaneous useful stuff into context for fun and profit.
+
+data Server = Server Uploads MaxChunkSize (LogEvent -> IO ())
+data Connection = Connection Socket Input
+data RequestHead = RequestHead RequestLine FieldMap
+
+data ConnectionContext = ConnectionContext Server Connection
+data RequestContext = RequestContext Server Connection RequestHead
+
+data Uploads = Uploads HashAddressed.Directory (TVar ResourceMap)
+
+-- Huh, this is a little chonky. Beautiful illustration, but chonky.
+-- newtype RequestHandler a = RequestHandler
+--   (ReaderT RequestContext (ExceptT Error (ResourceT IO)) a)
+--   deriving newtype (Functor, Applicative, Monad, MonadIO,
+--     MonadResource, MonadError Error, MonadReader RequestContext)
+
+-- Is this better? You be the judge.
+newtype RequestHandler a = RequestHandler
+    (RequestContext -> ResourceT IO (Either Error a))
+  deriving (Functor, Applicative, Monad, MonadIO,
+    MonadResource, MonadError Error, MonadReader RequestContext)
+  via (ReaderT RequestContext (ExceptT Error (ResourceT IO)))
+
+-- Let's get to asking our beautiful transformer stack for useful things
+getRequestHead :: RequestHandler RequestHead
+getRequestHead = do
+  RequestContext _ _ request <- ask
+  return request
+
+getMaxChunkSize :: RequestHandler MaxChunkSize
+getMaxChunkSize = do
+  RequestContext server _ _ <- ask
+  let Server _ maxChunkSize _ = server
+  return maxChunkSize
+
+getMethod :: RequestHandler Method
+getMethod = do
+  RequestHead requestLine _ <- getRequestHead
+  let RequestLine method _ _ = requestLine
+  return method
+
+getResourceName :: RequestHandler ResourceName
+getResourceName = do
+  RequestHead requestLine _ <- getRequestHead
+  let RequestLine _ (RequestTarget target) _ = requestLine
+  case A.convertStringMaybe target of
+    Nothing -> throwError notFoundError
+    Just text -> return $ ResourceName text
+
+sendResponseRH :: Response -> RequestHandler ()
+sendResponseRH r = do
+  RequestContext _ (Connection s _) _ <- ask
+  liftIO $ sendResponse s r
+
+sendStreamingResponseRH :: StreamingResponse -> RequestHandler ()
+sendStreamingResponseRH r = do
+  RequestContext _ (Connection s _) _ <- ask
+  liftIO $ sendStreamingResponse s r
+
+initializeHashDirectory :: IO HashAddressed.Directory
+initializeHashDirectory = do
+  dir <- do
+    root <- getDataDir
+    return $ root </> "uploads"
+  Dir.createDirectoryIfMissing True dir
+  return $ HashAddressed.Directory dir HashAddressed.sha256
+
+initializeUploads :: IO Uploads
+initializeUploads = do
+  hashDir <- initializeHashDirectory
+  resourceVar <- newTVarIO $ ResourceMap Map.empty
+  return $ Uploads hashDir resourceVar
+
+addDefaultFiles :: Uploads -> IO ()
+addDefaultFiles (Uploads hashDir var) = do
+  greetingFile <- do
+    result <- HashAddressed.writeLazy hashDir $ LT.encodeUtf8 (LT.pack "Hello!")
+    return $ HashAddressed.hashAddressedFile result
+  atomically do
+    ResourceMap m <- readTVar var
+    let m' = Map.insert rootResource greetingFile m
+    writeTVar var $ ResourceMap m'
+
+rootResource :: ResourceName
+rootResource = ResourceName [A.string|/|]
+
+initializeServer :: (Server -> IO a) -> IO a
+initializeServer proceed = do
+  uploads <- initializeUploads
+  addDefaultFiles uploads
+  unforkAsyncIO_ printLogEvent \log ->
+    proceed (Server uploads (MaxChunkSize 1_024) log)
+
+initializeConnection :: Server -> Socket -> IO ConnectionContext
+initializeConnection server@(Server _ maxChunkSize _) socket = do
+  i <- liftIO $ parseFromSocket socket maxChunkSize
+  return $ ConnectionContext server (Connection socket i)
+
+data Dead = Dead
+
+newtype ConnectionHandler a =
+    ConnectionHandler (ConnectionContext -> IO (Either Dead a))
+  deriving (Functor, Applicative, Monad, MonadIO, MonadError Dead,
+    MonadReader ConnectionContext)
+  via (ReaderT ConnectionContext (ExceptT Dead IO))
+
+runConnectionHandler :: ConnectionContext -> ConnectionHandler () -> IO ()
+runConnectionHandler context (ConnectionHandler f) = do
+  _ <- f context
+  return ()
+
+serverRH :: RequestHandler () -> IO ()
+serverRH rh = initializeServer \server ->
+  serve @IO HostAny "8000" \(socket, _) -> do
+    context <- initializeConnection server socket
+    runConnectionHandler context $
+      handleConnectionRequests rh
+
+handleConnectionRequests :: RequestHandler () -> ConnectionHandler ()
+handleConnectionRequests rh = forever do
+  request <- readRequestHead
+  runRequestHandler request rh
+
+  end <- readRequestPartCH "End of requests" P.atEnd
+  when end $ throwError Dead
+
+runRequestHandler :: RequestHead -> RequestHandler () -> ConnectionHandler ()
+runRequestHandler request (RequestHandler f) = do
+  ConnectionContext server connection <- ask
+  let requestContext = RequestContext server connection request
+  result <- liftIO . handleIOExceptions . runResourceT . f $ requestContext
+  case result of
+    Left e -> handleRequestErrorCH e
+    Right () -> return ()
+
+
+-- Exercises!
+--
+-- 51. Target file path
+-- Define `getUploads` and `getTargetFilePathRH` (type signatures given)
+getUploads :: RequestHandler Uploads
+getUploads = do
+  RequestContext server _ _ <- ask
+  let Server uploads _ _ = server
+  return uploads
+
+getTargetFilePathRH :: RequestHandler FilePath
+getTargetFilePathRH = do
+  rn <- getResourceName
+  Uploads _ var <- getUploads
+  ResourceMap m' <- readTVarIO var
+  case Map.lookup rn m' of
+    Nothing -> throwError notFoundError
+    Just fp -> return fp
+
+-- 52. Handle request error
+-- `handleRequestError`, now with context
+handleRequestErrorCH :: Error -> ConnectionHandler a
+handleRequestErrorCH (Error responseMaybe events) = do
+  ConnectionContext server connection <- ask
+  let Server _ _ log = server
+  for_ events (liftIO . log)
+  let Connection s _ = connection
+  for_ responseMaybe (liftIO . sendResponse s)
+  throwError Dead
+
+-- 53. Parse request part
+-- Define `readRequestPartCH` and `readRequestPartRH`, type signatures given
+readRequestPartCH :: String -> Parser a -> ConnectionHandler a
+readRequestPartCH description p = do
+  ConnectionContext _ connection <- ask
+  let Connection _ input = connection
+  result <- liftIO $ readRequestPart input description p
+  case result of
+    Left e -> handleRequestErrorCH e
+    Right x -> pure x
+
+readRequestPartRH :: String -> Parser a -> RequestHandler a
+readRequestPartRH description p = do
+  RequestContext _ connection _ <- ask
+  let Connection _ input = connection
+  result <- liftIO $ readRequestPart input description p
+  liftEither result
+
+-- 54. Read the request head
+-- Define `readRequestHead`, which uses `readRequestPartCH` to read the request
+-- line, the header fields and the blank line that follows the header fields.
+readRequestHead :: ConnectionHandler RequestHead
+readRequestHead = do
+  start <- readRequestPartCH "Request line" requestLineParser
+  let RequestLine _ _ version = start
+  requireVersionCH http_1_1 version
+
+  fieldList <- readRequestPartCH "Header fields" fieldListParser
+  let fields = fieldMapFromList fieldList
+  _ <- readRequestPartCH "End of header fields" . P.string $ line BS.empty
+
+  return $ RequestHead start fields
+
+requireVersionCH :: Version -> Version -> ConnectionHandler ()
+requireVersionCH expected actual =
+  case requireVersionX expected actual of
+    Left e -> handleRequestErrorCH e
+    Right () -> pure ()
+-- My initial solution was terrible as I neglected to use the tools I had just
+-- defined. Too much programming in too little time.
