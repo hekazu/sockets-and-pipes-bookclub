@@ -2141,8 +2141,8 @@ runConnectionHandler context (ConnectionHandler f) = do
   _ <- f context
   return ()
 
-serverRH :: RequestHandler () -> IO ()
-serverRH rh = initializeServer \server ->
+serveRH :: RequestHandler () -> IO ()
+serveRH rh = initializeServer \server ->
   serve @IO HostAny "8000" \(sock, _) -> do
     context <- initializeConnection server sock
     runConnectionHandler context $
