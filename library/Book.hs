@@ -2124,9 +2124,9 @@ initializeServer proceed = do
     proceed (Server uploads (MaxChunkSize 1_024) log)
 
 initializeConnection :: Server -> Socket -> IO ConnectionContext
-initializeConnection server@(Server _ maxChunkSize _) socket = do
-  i <- liftIO $ parseFromSocket socket maxChunkSize
-  return $ ConnectionContext server (Connection socket i)
+initializeConnection server@(Server _ maxChunkSize _) sock = do
+  i <- liftIO $ parseFromSocket sock maxChunkSize
+  return $ ConnectionContext server (Connection sock i)
 
 data Dead = Dead
 
@@ -2143,8 +2143,8 @@ runConnectionHandler context (ConnectionHandler f) = do
 
 serverRH :: RequestHandler () -> IO ()
 serverRH rh = initializeServer \server ->
-  serve @IO HostAny "8000" \(socket, _) -> do
-    context <- initializeConnection server socket
+  serve @IO HostAny "8000" \(sock, _) -> do
+    context <- initializeConnection server sock
     runConnectionHandler context $
       handleConnectionRequests rh
 
