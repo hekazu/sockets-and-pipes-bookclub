@@ -563,7 +563,7 @@ data Request = Request RequestLine [Field] (Maybe Body) deriving Show
 data Response = Response StatusLine [Field] (Maybe Body) deriving (Eq, Show)
 
 data RequestLine = RequestLine Method RequestTarget Version deriving Show
-data Method = Method (ASCII ByteString) deriving (Eq, Show)
+data Method = Method (ASCII ByteString) deriving (Eq, Ord, Show)
 data RequestTarget = RequestTarget (ASCII ByteString) deriving Show
 data Version = Version Digit Digit deriving (Eq, Show)
 
@@ -2236,3 +2236,193 @@ requireVersionCH expected actual =
     Right () -> pure ()
 -- My initial solution was terrible as I neglected to use the tools I had just
 -- defined. Too much programming in too little time.
+
+
+-- Chapter 17: Reading the body
+--
+-- Midnight with the Upload! We let users add more content to the site! Whoo!
+storageApp :: RequestHandler ()
+storageApp = do
+  method <- getMethod
+  case Map.lookup method methodMap of
+    Just action -> action
+    Nothing -> throwError . methodError $ Map.keys methodMap
+-- Should be noted that this does not work on the machine these are written on
+-- as HashAddressed wants to write stuff in tmp and data dir is in home which
+-- is on a different file system, both encrypted lol
+-- It is fixable by changing the data directory, sure, but that is more effort
+-- than this user is ready to put in right now.
+
+methodMap :: Map Method (RequestHandler ())
+methodMap = Map.fromList
+  [ (methodGet, handleGet)
+  , (methodPut, handlePut)
+  ]
+
+methodGet :: Method
+methodGet = Method [A.string|GET|]
+
+handleGet :: RequestHandler ()
+handleGet = do
+  h <- openTargetFile
+  maxChunkSize <- getMaxChunkSize
+  let r = hStreamingResponse h maxChunkSize
+  sendStreamingResponseRH r
+
+openTargetFile :: RequestHandler Handle
+openTargetFile = do
+  path <- getTargetFilePathRH
+  result <- liftResourceT $ binaryFileResourceX path ReadMode
+  (_, h) <- liftEither result
+  return h
+
+methodPut :: Method
+methodPut = Method [A.string|PUT|]
+
+continue :: Status
+continue = Status (StatusCode Digit1 Digit0 Digit0)
+  (Just $ ReasonPhrase [A.string|Continue|])
+
+created :: Status
+created = Status (StatusCode Digit2 Digit0 Digit1)
+  (Just $ ReasonPhrase [A.string|Created|])
+
+-- insertResource :: ResourceName -> FilePath -> RequestHandler InsertResult
+-- will be an exercise for later
+
+data InsertResult = New | Replace
+
+emptyBodyResponse :: Status -> [Field] -> Response
+emptyBodyResponse s additionalFields =
+    Response (status s) (len : additionalFields) (Just body)
+  where
+    len = Field contentLength $ bodyLengthValue body
+    body = Body LBS.empty
+
+bodyRequiredError :: Error
+bodyRequiredError = Error (Just response) []
+  where
+    response = textResponse badRequest [] message
+    message = LT.pack "Request body is required"
+
+handlePut :: RequestHandler ()
+handlePut = do
+  resource <- getResourceName
+  body <- appraiseBody
+  sendResponseRH $ Response (status continue) [] Nothing
+  filePath <- copyToFile body
+  result <- insertResource resource filePath
+  let s = case result of
+            New -> created
+            Replace -> ok
+  sendResponseRH $ emptyBodyResponse s []
+
+newtype RequestBody a = RequestBody (Input -> Producer ByteString IO (Either Error a))
+  deriving (Functor, Applicative, Monad, MonadIO, MonadReader Input, MonadError Error)
+  via (ReaderT Input (ExceptT Error (Producer ByteString IO)))
+
+yieldRequestBodyPart :: ByteString -> RequestBody ()
+yieldRequestBodyPart x = RequestBody \_ -> do
+  yield x
+  return $ Right ()
+
+readBodyPart :: String -> Parser a -> RequestBody a
+readBodyPart description p = do
+  i <- ask
+  result <- liftIO $ readRequestPart i description p
+  liftEither result
+
+lengthAndEncodingError :: Error
+lengthAndEncodingError = Error (Just response) []
+  where
+    response = textResponse badRequest [] message
+    message = LT.pack "Cannot use both Transfer-Encoding and Content-Length"
+
+appraiseBody :: RequestHandler (RequestBody ())
+appraiseBody = do
+  lengthMaybe <- getBodyLength
+  te <- hasTransferEncoding
+  case (te, lengthMaybe) of
+    (True, Just _) -> throwError lengthAndEncodingError
+    (False, Just n) -> return $ takeInput n
+    (True, Nothing) -> return theBodyChunked
+    (False, Nothing) -> throwError bodyRequiredError
+
+getBodyLength :: RequestHandler (Maybe Natural)
+getBodyLength = do
+  RequestHead _ fields <- getRequestHead
+  case readField (fieldNameCI contentLength) contentLengthParser fields of
+    FieldMissing -> return Nothing
+    FieldInvalid e -> throwError $ requestParseError e
+    FieldOkay x -> return $ Just x
+
+contentLengthParser :: Parser Natural
+contentLengthParser = do
+  s <- P.takeWhile1 A.isDigit
+  case A.readNaturalDecimal s of
+    Just n -> return n
+    _ -> empty
+
+hasTransferEncoding :: RequestHandler Bool
+hasTransferEncoding = do
+  RequestHead _ (FieldMap fields) <- getRequestHead
+  return $ Map.member (fieldNameCI transferEncoding) fields
+
+takeInput :: Natural -> RequestBody ()
+takeInput n = if n == 0 then return () else do
+  Input (P.RestorableInput next restore) <- ask
+  x <- liftIO next
+  when (BS.null x) $ throwError shortReadError
+  let len = fromIntegral (BS.length x) :: Natural
+  case compare len n of
+    EQ -> yieldRequestBodyPart x
+    LT -> do
+      yieldRequestBodyPart x
+      takeInput (n - len)
+    GT -> do
+      let (a,b) = BS.splitAt (fromIntegral n) x
+      yieldRequestBodyPart a
+      liftIO $ restore b
+
+shortReadError :: Error
+shortReadError = Error (Just response) [event]
+  where
+    response = textResponse badRequest [] message
+    event = LogEvent message
+    message = TB.toLazyText $
+      TB.fromString "Malformed request: Connection closed before completion of body"
+
+theBodyChunked :: RequestBody ()
+theBodyChunked = join $ readBodyPart "Chunked body" chunkedBodyParser
+
+chunkSizeParser :: Parser ChunkSize
+chunkSizeParser = do
+  string <- P.takeWhile1 A.isHexDigit
+  case A.readNaturalHexadecimal string of
+    Just n -> return $ ChunkSize n
+    Nothing -> empty
+
+chunkedBodyParser :: Parser (RequestBody ())
+chunkedBodyParser = do
+  cs@(ChunkSize n) <- chunkSizeParser <?> "chunk-size"
+  _ <- P.string (A.fromCharList crlf) <?> "End of chunk-size line"
+  return if n /= 0 then proceedIntoChunkData cs else proceedAfterLastChunk
+
+proceedIntoChunkData :: ChunkSize -> RequestBody ()
+proceedIntoChunkData (ChunkSize n) = do
+  takeInput n
+  _ <- readBodyPart "End of chunk data" . P.string $ A.fromCharList crlf
+  theBodyChunked
+
+proceedAfterLastChunk :: RequestBody ()
+proceedAfterLastChunk = do
+  _ <- readBodyPart "Trailer fields" fieldListParser
+  _ <- readBodyPart "End of trailer fields" . P.string $ line BS.empty
+  return ()
+
+copyToFile :: RequestBody () -> RequestHandler FilePath
+copyToFile (RequestBody xs) = do
+  RequestContext _ (Connection _ i) _ <- ask
+  Uploads dir _ <- getUploads
+  ((), result) <- HashAddressed.writeExcept dir (xs i)
+  return $ HashAddressed.hashAddressedFile result
